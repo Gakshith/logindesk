@@ -139,16 +139,13 @@ The Phase 2 test bed must fill every "unknown" cell with a real smoke test, befo
   - Local audit.
   - A README notice that the user is responsible for each site's terms.
 
-## 10. Questions for you
+## 10. Decisions (2026-11-11)
 
-1. **Instagram and other Meta sites.** Meta forbids automated access, and your own account could get flagged. Options:
-   - (a) Allow them with a one-time warning (recommended for your own use).
-   - (b) Block them by default and let users opt in.
-   - (c) Block them entirely.
-2. **First demo site.** Should it be a low-risk site such as GitHub, or does it have to be Instagram?
-3. **Apple Developer account ($99/yr).** It is needed for signed builds with real Touch ID and Secure Enclave and for notarization. Without it, source builds use passphrase plus keyring.
-4. **Licence.** Apache-2.0 (recommended) or AGPL-3.0.
-5. **Platforms for 0.1.** macOS only (recommended), or macOS plus Linux from the start?
+1. **No paid Apple Developer account.** Approval is a free native popup: Touch ID if an unsigned build can show it, otherwise the vault password. Secure Enclave key storage is out of scope. The vault key is protected by the vault password plus the OS keychain.
+2. **Testing:** our own fake test site first, then low-risk real sites (e.g. GitHub). Instagram is not a test target.
+3. **Licence:** Apache-2.0.
+4. **0.1 is macOS only.** Windows and Linux come later.
+5. **Email connection never silently fails.** If Gmail is not connected, or its token expired or was revoked, the broker returns `email_not_connected`. The agent then tells the user to run `logindesk connect gmail`, a one-click browser consent. The token is refreshed automatically on every use.
 
 ## 11. Things to test before Phase 1 locks the design
 
