@@ -7,7 +7,7 @@ Spike code: branch `spike/phase0`, folder `spikes/` (four standalone throwaway c
 |---|---|---|
 | 1 | Does an unsigned binary get the LocalAuthentication sheet? | _PENDING: needs the user at the Mac_ |
 | 2 | Can chromiumoxide drive installed Chrome over a pipe without `Runtime.enable`? | **No.** chromiumoxide 0.9.1 only does WebSocket and always sends `Runtime.enable`. A raw pipe client does all four things we need. |
-| 3 | What does each client do with a 40 s tool call? | All three return the 40 s result. Cursor cancels at **60 s**. Codex 0.165 and Claude Code did not time out at 90 s / 330 s. |
+| 3 | What does each client do with a 40 s tool call? | All three return the 40 s result. Cursor cancels at **60 s**, Codex 0.165 at **300 s** (progress doesn't extend it). Claude Code headless didn't time out at 330 s. |
 | 4 | Does an "In production", unverified Gmail client keep its refresh token past 7 days? | _PENDING: needs the user to create the client; the day-8 result is filed later_ |
 
 ---
@@ -70,8 +70,8 @@ Commands: `cargo build && ./target/debug/cdp pipe [--accept-lang=de-DE,de] [--di
 
 | Client | Mode | progressToken sent? | 40 s call | Longer call | Its timeout behaviour |
 |---|---|---|---|---|---|
-| Claude Code 2.1.318 | `claude -p … --allowedTools mcp__rmcpwait__wait_approval` | yes | `approved after 40s` | 330 s with progress: `approved after 330s`. 330 s quiet: _PENDING_ | no timeout seen up to 330 s |
-| Codex 0.165.0 | `codex exec` with `-c mcp_servers.rmcpwait.*` overrides | yes (protocol `2025-06-18`) | `approved after 40s` | 90 s with progress: ok. **90 s quiet (no progress): ok.** 400 s with progress: _PENDING_. 400 s quiet: _PENDING_ | the default is **not** 60 s in 0.165 (see below) |
+| Claude Code 2.1.318 | `claude -p … --allowedTools mcp__rmcpwait__wait_approval` | yes | `approved after 40s` | 330 s with progress: `approved after 330s`. **330 s quiet: `approved after 330s`** | no timeout seen up to 330 s, with or without progress (headless; interactive not measured) |
+| Codex 0.165.0 | `codex exec` with `-c mcp_servers.rmcpwait.*` overrides | yes (protocol `2025-06-18`) | `approved after 40s` | 90 s with progress: ok. **90 s quiet (no progress): ok.** 400 s with progress: **cancelled at 300.0 s**, `timed out awaiting tools/call after 300s`. 400 s quiet: also cancelled at 300.0 s. | hard **300 s** in 0.165; progress notifications do **not** extend it (not the 60 s the research expected) |
 | Cursor CLI 2026.11.05 | `cursor-agent -p --trust --mode ask --approve-mcps` | **no** | `approved after 40s` | 330 s: **cancelled at 60.0 s**, agent saw `MCP error -32001: Request timed out` | hard 60 s; sends `notifications/cancelled` |
 
 Server log excerpts:
@@ -80,6 +80,9 @@ Server log excerpts:
 # Cursor, seconds=330
 15:35:40.090 CALL start seconds=330 progress_token=None client=Some("Cursor 1.0.0 proto=…\"2025-11-25\"")
 15:36:40.099 CALL cancelled by client after 60.0s
+# Codex, seconds=400 with progress every 5 s
+15:35:19.308 CALL start seconds=400 quiet=false progress_token=Some(ProgressToken(Number(1)))
+15:40:19.321 CALL cancelled by client after 300.0s
 # Codex, seconds=90 quiet
 15:35:19.627 CALL start seconds=90 quiet=true progress_token=None client=Some("codex-mcp-client 0.165.0 …")
 15:36:49.625 CALL done after 90.0s -> returning result
@@ -110,7 +113,15 @@ _PENDING_
 
 ## Config entries added and removed
 
-_PENDING_
+All client runs used two scratch project dirs outside the repo (`$TMPDIR/…/scratchpad/clientproj` and `…/cursorproj`).
+
+| Client | Added | Removed / verified |
+|---|---|---|
+| Claude Code | `claude mcp add -s local rmcpwait -e SPIKE_LOG=… -- <spike bin>`, i.e. `~/.claude.json` → `projects["…/clientproj"].mcpServers.rmcpwait` | `claude mcp remove rmcpwait -s local`; `claude mcp get rmcpwait` → "No MCP server named rmcpwait"; that project's `mcpServers` = `{}` |
+| Codex | nothing persisted; `-c mcp_servers.rmcpwait.{command,env,default_tools_approval_mode}` per run, `--ephemeral` | `~/.codex/config.toml` byte-identical to the pre-spike copy (`diff -q`) |
+| Cursor CLI | `…/cursorproj/.cursor/mcp.json` and `…/cursorproj/.cursor/cli.json` (allow `Mcp(rmcpwait:wait_approval)`); cursor-agent itself created `~/.cursor/projects/<…-scratchpad-cursorproj>/` (mcp-approvals.json, .workspace-trusted, transcripts) | `.cursor/` deleted; the `~/.cursor/projects/…cursorproj` dir moved to Trash; `~/.cursor/mcp.json` and `cli-config.json` permissions unchanged |
+
+The popup spike (§1) adds and removes its own entry; it will be listed here too.
 
 ---
 
