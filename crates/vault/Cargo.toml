@@ -1,6 +1,6 @@
 [package]
 name = "logindesk-vault"
-description = "Encrypted local vault for logindesk (skeleton)."
+description = "Encrypted local vault for logindesk."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,31 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+logindesk-core = { path = "../core" }
+zeroize = { workspace = true }
+rusqlite = { workspace = true }
+chacha20poly1305 = { workspace = true }
+argon2 = { workspace = true }
+hkdf = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+libc = { workspace = true }
+csv = { workspace = true }
+
+[dev-dependencies]
+proptest = { workspace = true }
+
+# This crate restates the workspace lints instead of inheriting them: it needs
+# `unsafe_code = "deny"` (not "forbid") so that ONE module, src/hardening.rs,
+# can `allow` it for mlock / setrlimit / ptrace. Keep the rest in sync with the
+# root Cargo.toml. CI checks that no other crate or module uses unsafe.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
+unwrap_used = "warn"
