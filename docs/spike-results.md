@@ -5,7 +5,7 @@ Spike code: branch `spike/phase0`, folder `spikes/` (four standalone throwaway c
 
 | # | Question | Answer |
 |---|---|---|
-| 1 | Does an unsigned binary get the LocalAuthentication sheet? | _PENDING: needs the user at the Mac_ |
+| 1 | Does an unsigned binary get the LocalAuthentication sheet? | **Yes.** An unsigned `cargo build` binary (ad-hoc, linker-signed) got the sheet both when spawned with no TTY and as a Claude Code stdio MCP child. The `osascript` typed-password fallback works without a TTY too. **Deny/Cancel has not been recorded yet.** |
 | 2 | Can chromiumoxide drive installed Chrome over a pipe without `Runtime.enable`? | **No.** chromiumoxide 0.9.1 only does WebSocket and always sends `Runtime.enable`. A raw pipe client does all four things we need. |
 | 3 | What does each client do with a 40 s tool call? | All three return the 40 s result. Cursor cancels at **60 s**, Codex 0.165 at **300 s** (progress doesn't extend it). Claude Code headless didn't time out at 330 s. |
 | 4 | Does an "In production", unverified Gmail client keep its refresh token past 7 days? | _PENDING: needs the user to create the client; the day-8 result is filed later_ |
@@ -101,7 +101,40 @@ Server log excerpts:
 
 ## 1. Approval popup (LocalAuthentication)
 
-_PENDING_
+**Setup.** `spikes/la-popup` uses objc2-local-authentication 0.3.2:
+- `canEvaluatePolicy` + `evaluatePolicy(.deviceOwnerAuthentication)`, with the reply block bridged to a channel. A 120 s timeout calls `invalidate()`.
+- The fallback is an `osascript` `display dialog … with hidden answer` that compares the typed value with the fake vault password `spike-vault`. It logs only the match result, never the typed text.
+- `la-popup mcp` serves `approve_touchid` and `approve_password` as an rmcp stdio server.
+- The binary is an unsigned debug build. `codesign -dv` shows `Signature=adhoc`, `flags=0x20002(adhoc,linker-signed)`, and no Developer ID.
+
+The lead session ran these on 2026-11-11 with the user at the Mac (Touch ID Mac, macOS 26.6.2). The ld-spikes code was unchanged.
+
+| Run | How it was started | Result |
+|---|---|---|
+| (a) `la-popup auth 2` | spawned from an agent shell, **no TTY** (`tty=false` in the log) | `canEvaluate=ok biometryType=LABiometryType(1)`. Attempt 1: `SUCCESS after 7348ms`. Attempt 2: `SUCCESS after 52783ms` (meant to be Cancel; the user approved instead) |
+| (b) `la-popup fallback` ×2 | same | Run 1: `PASSWORD_MISMATCH after 31189ms` (wrong text typed, correctly rejected). Run 2: `TIMED_OUT_OR_EMPTY after 873ms` (dialog dismissed at once, probably a held Enter) |
+| (c) as a Claude Code stdio MCP child | `claude -p --mcp-config <temp json> --strict-mcp-config --allowedTools mcp__lapopup__approve_touchid,mcp__lapopup__approve_password` | `approve_touchid` → `canEvaluate=ok biometryType=LABiometryType(1); SUCCESS after 34876ms`. `approve_password` → `PASSWORD_MATCH after 18271ms`. The server log shows ppid = the `claude` process and `tty=false`. |
+| (d) deny attempt, `la-popup auth 1` | same as (a) | `SUCCESS after 7728ms`. Cancel was **not** recorded; the lead is asking the user whether an Apple Watch or Touch ID approved it. |
+
+Log excerpt for (a) and (b), from `$TMPDIR/la-popup.log` (ld-spikes copy):
+
+```text
+15:51:58.723 pid=46336 ppid=46332 tty=false CHECK canEvaluate=ok biometryType=LABiometryType(1)
+15:52:06.083 pid=46336 ppid=46332 tty=false AUTH result: SUCCESS after 7348ms
+15:52:58.908 pid=46336 ppid=46332 tty=false AUTH result: SUCCESS after 52783ms
+15:53:36.023 pid=47481 ppid=47480 tty=false FALLBACK result: PASSWORD_MISMATCH after 31189ms
+15:53:45.169 pid=48331 ppid=48329 tty=false FALLBACK result: TIMED_OUT_OR_EMPTY after 873ms
+```
+
+**Findings**
+- **No -1000 on the first call.** The very first `evaluatePolicy` from a freshly built unsigned binary succeeded.
+- **No TTY or app bundle needed.** Every run had `tty=false`, including the MCP child. LocalAuthentication showed its system sheet anyway, so the daemon can call it directly. (a) was not run in an interactive terminal tab; the no-TTY and MCP-child cases are the harder ones, and both passed.
+- **An approval can take up to ~53 s.** That is already beyond the 40 s in-call budget (§3), so `awaiting_approval` + `wait(handle)` will happen in practice.
+- **Run (b)2 shows a held key can dismiss the fallback dialog in under 1 s.** The fallback must treat empty or instant answers as "no answer", never as approval. It did here (`TIMED_OUT_OR_EMPTY`).
+- **Still open:**
+  - the deny / Cancel error code (expected `LAError.userCancel`, -2)
+  - whether an Apple Watch can satisfy `.deviceOwnerAuthentication` (it can by design if one is paired; that matters for "a computer-use agent can't click approve")
+  - one run from an interactive terminal tab
 
 ---
 
@@ -121,7 +154,7 @@ All client runs used two scratch project dirs outside the repo (`$TMPDIR/…/scr
 | Codex | nothing persisted; `-c mcp_servers.rmcpwait.{command,env,default_tools_approval_mode}` per run, `--ephemeral` | `~/.codex/config.toml` byte-identical to the pre-spike copy (`diff -q`) |
 | Cursor CLI | `…/cursorproj/.cursor/mcp.json` and `…/cursorproj/.cursor/cli.json` (allow `Mcp(rmcpwait:wait_approval)`); cursor-agent itself created `~/.cursor/projects/<…-scratchpad-cursorproj>/` (mcp-approvals.json, .workspace-trusted, transcripts) | `.cursor/` deleted; the `~/.cursor/projects/…cursorproj` dir moved to Trash; `~/.cursor/mcp.json` and `cli-config.json` permissions unchanged |
 
-The popup spike (§1) adds and removes its own entry; it will be listed here too.
+The popup spike (§1) wrote no client config: the lead ran it with `claude -p --mcp-config <temp file> --strict-mcp-config`, so nothing was added to `~/.claude.json`.
 
 ---
 
