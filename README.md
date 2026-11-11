@@ -39,4 +39,4 @@ Not runnable yet.
 
 ## Licence
 
-To be decided before the first public release (Apache-2.0 proposed).
+Apache-2.0. See [LICENSE](LICENSE).

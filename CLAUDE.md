@@ -1,7 +1,19 @@
 # logindesk
 
 ## Build / test
-No code yet. Commands get added here when the first crate lands.
+Homebrew's rustup is keg-only on some Macs: `export PATH="/opt/homebrew/opt/rustup/bin:$PATH"` if `cargo` is missing.
+
+```bash
+cargo fmt --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo deny check && cargo audit
+```
+
+## Layout
+- `crates/*`: core, vault, policy, approver, executor, mail, daemon, mcp, cli (binary `logindesk`).
+- `testbed/`: fake site, hostile MCP client, canary leak harness. Test-only; never a dependency of `crates/*`.
+- Dependencies are pinned exactly (`=x.y.z`) in `[workspace.dependencies]`.
 
 ## Architecture (planned)
 - Rust broker daemon: vault, policy, approvals, audit, OTP parser. Everything that touches a secret lives here.

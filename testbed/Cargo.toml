@@ -1,0 +1,12 @@
+[package]
+name = "testbed"
+description = "Test-only: fake site, hostile MCP client and canary leak harness for logindesk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
