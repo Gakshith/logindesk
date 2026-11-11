@@ -1,0 +1,16 @@
+[package]
+name = "la-popup"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+anyhow = "1.0.104"
+block2 = "0.6.2"
+chrono = "0.4.45"
+objc2 = "0.6.5"
+objc2-foundation = "0.3.2"
+objc2-local-authentication = "=0.3.2"
+rmcp = { version = "3.9", features = ["server", "transport-io", "macros"] }
+schemars = "1.2.3"
+serde = "1.0.229"
+tokio = { version = "1.54.1", features = ["full"] }
