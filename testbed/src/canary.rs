@@ -60,49 +60,71 @@ impl Marker {
         }
     }
 
-    /// Every (encoding name, needle) pair the scanner looks for.
-    pub fn needles(&self) -> Vec<(String, String)> {
+    /// Every text form a secret can take before any binary encoding is applied.
+    fn text_forms(&self) -> Vec<(&'static str, String)> {
         let raw = self.value.clone();
-        let bytes = raw.as_bytes();
-        let mut out: Vec<(String, String)> = vec![("raw".into(), raw.clone())];
+        let url = percent_encode(&raw, false);
+        vec![
+            ("raw", raw.clone()),
+            ("json", json_escape(&raw)),
+            ("json-ascii", json_escape_ascii(&raw)),
+            ("url-lower", url_lower_hex(&url)),
+            ("form-url", percent_encode(&raw, true)),
+            ("url", url),
+        ]
+    }
 
-        // base64: the marker's encoding depends on its alignment inside the surrounding data.
-        // Encode with 0, 1 and 2 bytes of prefix, then drop the boundary blocks that mix in
-        // unknown neighbouring bytes. The long middle part is what any embedding must contain.
-        for (name, engine) in [
-            ("base64", &base64::engine::general_purpose::STANDARD),
-            ("base64url", &base64::engine::general_purpose::URL_SAFE),
-        ] {
-            for k in 0..3usize {
-                let mut buf = vec![0u8; k];
-                buf.extend_from_slice(bytes);
-                let enc = engine.encode(&buf);
-                let start = if k == 0 { 0 } else { 4 };
-                let end = enc.trim_end_matches('=').len().saturating_sub(4);
-                if end > start + WINDOW {
-                    out.push((format!("{name}@{k}"), enc[start..end].to_string()));
+    /// Every (encoding name, needle) pair the scanner looks for.
+    ///
+    /// For each text form (raw, JSON-escaped, JSON `\u`-escaped, URL, form-URL, lower-case URL) it adds:
+    /// - the form itself and every 8-char window of it;
+    /// - base64 and base64url of it at all three byte alignments;
+    /// - hex of it, lower and upper case.
+    ///
+    /// So composites are caught too: `base64url({"password": marker})` (JWT payloads, cookies, `data:` URLs)
+    /// and `hex(json)` match the JSON form's needles.
+    pub fn needles(&self) -> Vec<(String, String)> {
+        let mut out: Vec<(String, String)> = Vec::new();
+        let mut seen = BTreeSet::new();
+        let mut push = |out: &mut Vec<(String, String)>, name: String, needle: String| {
+            if seen.insert(needle.clone()) {
+                out.push((name, needle));
+            }
+        };
+        for (form, text) in self.text_forms() {
+            push(&mut out, form.to_string(), text.clone());
+            let bytes = text.as_bytes();
+            // base64: the encoding depends on the text's alignment inside the surrounding data.
+            // Encode with 0, 1 and 2 bytes of prefix, then drop the boundary blocks that mix in
+            // unknown neighbouring bytes. The long middle part is what any embedding must contain.
+            for (name, engine) in [
+                ("base64", &base64::engine::general_purpose::STANDARD),
+                ("base64url", &base64::engine::general_purpose::URL_SAFE),
+            ] {
+                for k in 0..3usize {
+                    let mut buf = vec![0u8; k];
+                    buf.extend_from_slice(bytes);
+                    let enc = engine.encode(&buf);
+                    let start = if k == 0 { 0 } else { 4 };
+                    let end = enc.trim_end_matches('=').len().saturating_sub(4);
+                    if end > start + WINDOW {
+                        push(
+                            &mut out,
+                            format!("{name}({form})@{k}"),
+                            enc[start..end].to_string(),
+                        );
+                    }
                 }
             }
-        }
-        let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
-        out.push(("hex".into(), hex.clone()));
-        out.push(("HEX".into(), hex.to_uppercase()));
-        let url = percent_encode(&raw, false);
-        let form = percent_encode(&raw, true);
-        out.push(("url".into(), url.clone()));
-        out.push(("form-url".into(), form));
-        out.push(("url-lower".into(), url_lower_hex(&url)));
-        let json = json_escape(&raw);
-        out.push(("json".into(), json.clone()));
-        out.push(("json-ascii".into(), json_escape_ascii(&raw)));
-
-        for (label, s) in [("raw", &raw), ("url", &url), ("json", &json)] {
-            let cs: Vec<char> = s.chars().collect();
+            let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
+            push(&mut out, format!("hex({form})"), hex.to_uppercase());
+            push(&mut out, format!("hex({form})"), hex);
+            let cs: Vec<char> = text.chars().collect();
             for i in 0..cs.len().saturating_sub(WINDOW - 1) {
                 let w: String = cs[i..i + WINDOW].iter().collect();
                 // A window made only of encoding punctuation would match unrelated text.
                 if w.chars().filter(char::is_ascii_alphanumeric).count() >= 5 {
-                    out.push((format!("window8({label})@{i}"), w));
+                    push(&mut out, format!("window8({form})@{i}"), w);
                 }
             }
         }
@@ -173,6 +195,9 @@ pub struct Channel {
 pub struct Capture {
     /// The channels in capture order.
     pub channels: Vec<Channel>,
+    /// Files or directories that could not be read. Any entry makes the report fail:
+    /// a wrong path must never turn into a "clean" scan.
+    pub errors: Vec<String>,
 }
 
 impl Capture {
@@ -190,14 +215,19 @@ impl Capture {
         self
     }
 
-    /// Add one file (log file, audit log …). A missing file is recorded as an empty channel.
+    /// Add one file (log file, audit log …). A missing or unreadable file is a capture error,
+    /// which fails the report.
     pub fn file(&mut self, path: impl AsRef<Path>) -> &mut Self {
         let p = path.as_ref();
-        let data = std::fs::read(p).unwrap_or_default();
-        self.channels.push(Channel {
-            name: format!("file:{}", p.display()),
-            data,
-        });
+        match std::fs::read(p) {
+            Ok(data) => self.channels.push(Channel {
+                name: format!("file:{}", p.display()),
+                data,
+            }),
+            Err(e) => self
+                .errors
+                .push(format!("missing:file:{} ({e})", p.display())),
+        }
         self
     }
 
@@ -205,10 +235,23 @@ impl Capture {
     pub fn dir(&mut self, dir: impl AsRef<Path>) -> &mut Self {
         let mut stack: Vec<PathBuf> = vec![dir.as_ref().to_path_buf()];
         while let Some(d) = stack.pop() {
-            let Ok(rd) = std::fs::read_dir(&d) else {
-                continue;
+            let rd = match std::fs::read_dir(&d) {
+                Ok(rd) => rd,
+                Err(e) => {
+                    self.errors
+                        .push(format!("missing:dir:{} ({e})", d.display()));
+                    continue;
+                }
             };
-            for e in rd.flatten() {
+            for e in rd {
+                let e = match e {
+                    Ok(e) => e,
+                    Err(err) => {
+                        self.errors
+                            .push(format!("unreadable:entry-in:{} ({err})", d.display()));
+                        continue;
+                    }
+                };
                 let p = e.path();
                 self.channels.push(Channel {
                     name: format!("filename:{}", p.display()),
@@ -219,7 +262,10 @@ impl Capture {
                     Ok(t) if t.is_file() => {
                         self.file(&p);
                     }
-                    _ => {}
+                    Ok(_) => {}
+                    Err(err) => self
+                        .errors
+                        .push(format!("unreadable:type:{} ({err})", p.display())),
                 }
             }
         }
@@ -245,12 +291,14 @@ pub struct Report {
     pub findings: Vec<Finding>,
     /// How many channels were scanned.
     pub channels_scanned: usize,
+    /// Capture errors (missing or unreadable files and directories). Any entry fails the report.
+    pub capture_errors: Vec<String>,
 }
 
 impl Report {
-    /// True when no marker was found anywhere.
+    /// True when no marker was found anywhere **and** every requested file and directory was read.
     pub fn is_clean(&self) -> bool {
-        self.findings.is_empty()
+        self.findings.is_empty() && self.capture_errors.is_empty()
     }
 
     /// True if `marker` was found in a channel whose name contains `channel`.
@@ -268,7 +316,7 @@ impl Report {
 
 impl fmt::Display for Report {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        if self.findings.is_empty() {
+        if self.is_clean() {
             return writeln!(
                 f,
                 "canary: clean ({} channels scanned)",
@@ -277,10 +325,14 @@ impl fmt::Display for Report {
         }
         writeln!(
             f,
-            "canary: {} leak(s) in {} channels scanned",
+            "canary: {} leak(s), {} capture error(s) in {} channels scanned",
             self.findings.len(),
+            self.capture_errors.len(),
             self.channels_scanned
         )?;
+        for e in &self.capture_errors {
+            writeln!(f, "  CAPTURE ERROR {e}")?;
+        }
         for x in &self.findings {
             writeln!(
                 f,
@@ -344,6 +396,7 @@ impl Canary {
         Report {
             findings: found.into_iter().collect(),
             channels_scanned: cap.channels.len(),
+            capture_errors: cap.errors.clone(),
         }
     }
 }
@@ -414,6 +467,43 @@ mod tests {
                     .unwrap_or_default()
                     .replace('é', "\\u00e9"),
             ),
+            // Composites: JSON or URL first, then a binary encoding (review round 1).
+            (
+                "jwt-style base64url(json)",
+                format!(
+                    "eyJhbGciOiJub25lIn0.{}.",
+                    base64::engine::general_purpose::URL_SAFE_NO_PAD
+                        .encode(serde_json::json!({"password": v}).to_string())
+                ),
+            ),
+            (
+                "hex(json)",
+                serde_json::json!({"password": v})
+                    .to_string()
+                    .bytes()
+                    .map(|x| format!("{x:02x}"))
+                    .collect(),
+            ),
+            (
+                "base64(json) in a data: URL",
+                format!(
+                    "data:application/json;base64,{}",
+                    base64::engine::general_purpose::STANDARD
+                        .encode(serde_json::json!({"k": [1, v]}).to_string())
+                ),
+            ),
+            (
+                "base64(form-url)",
+                base64::engine::general_purpose::STANDARD
+                    .encode(format!("user=a&password={}", percent_encode(&v, true))),
+            ),
+            (
+                "HEX(url)",
+                percent_encode(&v, false)
+                    .bytes()
+                    .map(|x| format!("{x:02X}"))
+                    .collect(),
+            ),
             (
                 "truncated",
                 format!("…{}…", v.chars().skip(3).take(12).collect::<String>()),
@@ -452,5 +542,22 @@ mod tests {
             r.to_string()
                 .contains("LEAK marker=vault.password channel=mcp:tools/call#1")
         );
+    }
+
+    #[test]
+    fn missing_file_or_dir_fails_the_report() {
+        let c = one();
+        let mut cap = Capture::new();
+        cap.text("stderr", "nothing here")
+            .file("/nonexistent/logindesk/audit.jsonl")
+            .dir("/nonexistent/logindesk/tmp");
+        let r = c.scan(&cap);
+        assert!(r.findings.is_empty());
+        assert!(!r.is_clean(), "a capture error must not count as clean");
+        assert_eq!(r.capture_errors.len(), 2, "{r}");
+        let text = r.to_string();
+        assert!(text.contains("CAPTURE ERROR missing:file:/nonexistent/logindesk/audit.jsonl"));
+        assert!(text.contains("CAPTURE ERROR missing:dir:/nonexistent/logindesk/tmp"));
+        assert!(std::panic::catch_unwind(|| r.assert_clean()).is_err());
     }
 }
