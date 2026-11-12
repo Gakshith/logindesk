@@ -13,13 +13,14 @@ fn main() {
     std::fs::create_dir_all(&dir).unwrap();
     let pw = SecretString::new("a tuning password, not a real one".into());
     let grid: &[(u32, u32)] = &[
-        (64, 3),
-        (128, 2),
         (128, 3),
         (256, 2),
-        (256, 3),
         (256, 4),
+        (256, 6),
+        (384, 4),
         (512, 2),
+        (512, 3),
+        (512, 4),
     ];
     eprintln!(
         "{:>8} {:>3} {:>3}  {:>10}  {:>10}  {:>10}",

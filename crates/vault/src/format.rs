@@ -46,8 +46,8 @@ impl KdfParams {
     /// Defaults for new vaults, tuned for 0.5–1.0 s unlock on an M-series
     /// Mac. See `docs/crypto-spec.md` for the measurement and the OWASP check.
     pub const DEFAULT: Self = Self {
-        m_kib: 256 * 1024,
-        t: 2,
+        m_kib: 512 * 1024,
+        t: 3,
         p: 1,
     };
     /// The OWASP Password Storage Cheat Sheet minimum (19 MiB, t=2, p=1).
@@ -390,6 +390,10 @@ pub fn decode_payload(bytes: &[u8]) -> Result<(PayloadFields, zeroize::Zeroizing
     }
     let mut outer = Reader::new(bytes);
     let content_len = outer.u32()? as usize;
+    // Canonical: exactly the minimal padding (found by cargo fuzz, 2026-11-11).
+    if (4 + content_len).div_ceil(PAD_BUCKET) * PAD_BUCKET != bytes.len() {
+        return Err(Error::Corrupt("payload padding"));
+    }
     let content = outer.take(content_len)?;
     if outer.rest().iter().any(|&b| b != 0) {
         return Err(Error::Corrupt("payload padding"));
@@ -543,6 +547,23 @@ mod tests {
         let b = encode_payload(&f, &[b'y'; 150]).unwrap();
         assert_eq!(a.len(), PAD_BUCKET);
         assert_eq!(b.len(), PAD_BUCKET);
+    }
+
+    #[test]
+    fn over_padded_payload_is_rejected() {
+        // Regression: fuzz crash-102e28da (a 60-byte payload padded to 512).
+        let f = PayloadFields {
+            created_at: 1,
+            updated_at: 2,
+            site: "example.test".into(),
+            username: "alice".into(),
+            created_by: "cli".into(),
+            notes: String::new(),
+        };
+        let mut b = encode_payload(&f, b"pw").unwrap().to_vec();
+        assert!(decode_payload(&b).is_ok());
+        b.resize(b.len() + PAD_BUCKET, 0);
+        assert!(matches!(decode_payload(&b), Err(Error::Corrupt(_))));
     }
 
     #[test]
