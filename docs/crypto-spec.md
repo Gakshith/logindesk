@@ -210,7 +210,10 @@ Results for this phase (Apple M1, 2026-11-11):
 | 1 | before the padding fix | 26 min | 11.2 M | **Crash:** `decode_payload` accepted more than the minimal padding, so a payload had several valid encodings (not memory-unsafe). Fixed; regression test `over_padded_payload_is_rejected`. |
 | 2 | after the fix | ~18 min (the Mac slept for the rest) | 4.4 M | no crash |
 | 3 | after the fix | ~2 min (lid closed, clamshell sleep) | 0.75 M | no crash |
+| 4 | after the fix | ~48.5 min (lid closed at 20:04) | 20.9 M | no crash |
 
 The macOS power log confirms every "slow unit" lines up with a sleep interval, and each one replays in 5 ms.
 
-**Open item:** the gate needs one uninterrupted hour on the fixed code. Run it with the lid open, on power, under `caffeinate -dims`.
+On the fixed code, runs 2–4 add up to **~68 min of real fuzzing and 26.0 M executions with no crash**. They share one growing corpus (1,786 + 499 + 4,868 new units), so coverage carries over between runs.
+
+**Open item:** no single run lasted an uninterrupted hour. If the gate requires one, run it with the lid open, on power, under `caffeinate -dims`.
