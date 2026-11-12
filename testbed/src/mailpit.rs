@@ -22,6 +22,53 @@ pub struct Mailpit {
     pub http: SocketAddr,
 }
 
+/// Every container the test bed creates carries this label.
+pub const LABEL: &str = "logindesk-testbed=1";
+/// The PID of the test-bed process that owns a container.
+pub const OWNER_LABEL: &str = "logindesk-testbed.pid";
+
+/// Remove test-bed containers whose owning process is gone (left over after SIGKILL or a crash).
+/// Containers owned by a live process, such as another worktree's test bed, are left alone.
+/// Returns how many were removed.
+pub fn remove_stale() -> usize {
+    let Ok(out) = Command::new("docker")
+        .args([
+            "ps",
+            "-a",
+            "--filter",
+            &format!("label={LABEL}"),
+            "--format",
+            &format!("{{{{.ID}}}} {{{{.Label \"{OWNER_LABEL}\"}}}}"),
+        ])
+        .output()
+    else {
+        return 0;
+    };
+    let mut removed = 0;
+    for line in String::from_utf8_lossy(&out.stdout).lines() {
+        let mut it = line.split_whitespace();
+        let (Some(id), pid) = (it.next(), it.next().and_then(|p| p.parse::<u32>().ok())) else {
+            continue;
+        };
+        let alive = pid.is_some_and(|p| {
+            Command::new("kill")
+                .args(["-0", &p.to_string()])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        });
+        if !alive
+            && Command::new("docker")
+                .args(["rm", "-f", id])
+                .output()
+                .is_ok_and(|o| o.status.success())
+        {
+            eprintln!("[testbed] removed stale Mailpit container {id} (owner pid {pid:?} is gone)");
+            removed += 1;
+        }
+    }
+    removed
+}
+
 /// True when the `docker` CLI exists and the daemon answers.
 pub fn docker_available() -> bool {
     Command::new("docker")
@@ -45,6 +92,8 @@ fn port_of(container: &str, inner: &str) -> Result<SocketAddr, String> {
 impl Mailpit {
     /// Start the container and wait until SMTP accepts connections (30 s max).
     pub fn start() -> Result<Self, String> {
+        remove_stale();
+        let owner = format!("{OWNER_LABEL}={}", std::process::id());
         let container = format!(
             "logindesk-testbed-mailpit-{}-{}",
             std::process::id(),
@@ -55,6 +104,10 @@ impl Mailpit {
                 "run",
                 "-d",
                 "--rm",
+                "--label",
+                LABEL,
+                "--label",
+                &owner,
                 "--name",
                 &container,
                 "-p",

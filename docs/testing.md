@@ -22,7 +22,7 @@ Every URL, port and fixture credential is printed on stderr:
 [testbed] gmail mock  http://example.localhost:55020/gmail/v1/users/me/messages  (Authorization: Bearer …)
 [testbed] accounts    alice@example.localhost and otp@example.localhost (needs email code), password …
 [testbed] mailpit     smtp 127.0.0.1:55017  ui http://127.0.0.1:55018/  (axllent/mailpit:v1.33.1@sha256:aef2…61ce)
-[testbed] Ctrl-C to stop
+[testbed] Ctrl-C or SIGTERM to stop
 ```
 
 | Flag | Effect |
@@ -37,7 +37,8 @@ Every URL, port and fixture credential is printed on stderr:
 - Everything binds `127.0.0.1` only. Mailpit is published with `-p 127.0.0.1::1025 -p 127.0.0.1::8025`, so Docker picks free host ports.
 - No fixed port is ever bound, so several worktrees can run at once.
 - `*.localhost` resolves to loopback in Chrome and curl, so `example.localhost` and the lookalike `examp1e.localhost` need no DNS or `/etc/hosts` changes.
-- Ctrl-C removes the Mailpit container.
+- Ctrl-C, SIGTERM or SIGHUP removes the Mailpit container.
+- Every container is labelled `logindesk-testbed=1` and `logindesk-testbed.pid=<owner pid>`. If a test bed was killed with SIGKILL or crashed, the next start removes its leftover container. Containers whose owner is still running (another worktree's test bed) are left alone.
 
 ## The fake site
 
@@ -92,17 +93,22 @@ canary.scan(&cap).assert_clean();
 
 **Markers:** each is 32 random alphanumerics with `" \ / + & % space é` mixed in, so URL and JSON encoding really change the bytes.
 
-**What the scanner matches:**
+**What the scanner matches.** It starts from every *text form* of each marker:
 - raw
-- base64 and base64url at all 3 byte alignments
-- hex (lower and upper case)
-- URL encoding (`%20`, `+`, lower-case hex)
 - JSON-escaped (UTF-8 and `\u` forms)
-- every 8-character window of the raw, URL and JSON forms (a window must contain at least 5 alphanumerics)
+- URL-encoded (`%20`, `+`, lower-case hex)
 
-`Capture::dir` scans file names as well as file contents.
+Each text form is then matched:
+- as itself
+- as base64 and base64url at all 3 byte alignments
+- as hex (lower and upper case)
+- as every 8-character window that contains at least 5 alphanumerics
 
-**Report:** one line per hit, `LEAK marker=<id> channel=<channel> encoding=<encoding>`. `assert_clean()` panics on any hit.
+So composites are caught, for example `base64url({"password": marker})` in a JWT-style token or cookie, `hex(json)`, and `data:…;base64,` JSON.
+
+`Capture::dir` scans file names as well as file contents. A file or directory that can't be read (a wrong audit-log path, say) is recorded as a `CAPTURE ERROR` and **fails** the report. It never counts as clean.
+
+**Report:** one line per hit, `LEAK marker=<id> channel=<channel> encoding=<encoding>` (e.g. `base64url(json)@1`), plus one `CAPTURE ERROR …` line per unreadable path. `assert_clean()` panics on either.
 
 **Gate** (`testbed/tests/canary_gate.rs`): a child process leaks one marker to stderr and writes another, base64-encoded, to a temp file. The test asserts that both are caught with the right channel and encoding, that untouched markers and clean channels give no false positives, and that `assert_clean()` fails. A matching clean run must pass. Panic output is checked the same way.
 

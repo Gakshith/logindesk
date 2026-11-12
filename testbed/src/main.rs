@@ -92,9 +92,26 @@ async fn main() -> std::process::ExitCode {
             s.base()
         ),
     }
-    eprintln!("[testbed] Ctrl-C to stop");
-    let _ = tokio::signal::ctrl_c().await;
+    eprintln!("[testbed] Ctrl-C or SIGTERM to stop");
+    wait_for_shutdown().await;
     eprintln!("[testbed] stopping");
     drop(mailpit);
     std::process::ExitCode::SUCCESS
+}
+
+/// Ctrl-C, SIGTERM or SIGHUP. (SIGKILL cannot be caught: the next start removes that container.)
+async fn wait_for_shutdown() {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut term), Ok(mut hup)) = (
+        signal(SignalKind::terminate()),
+        signal(SignalKind::hangup()),
+    ) else {
+        let _ = tokio::signal::ctrl_c().await;
+        return;
+    };
+    tokio::select! {
+        _ = tokio::signal::ctrl_c() => {}
+        _ = term.recv() => {}
+        _ = hup.recv() => {}
+    }
 }
