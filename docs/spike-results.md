@@ -8,7 +8,94 @@ Spike code: branch `spike/phase0`, folder `spikes/` (four standalone throwaway c
 | 1 | Does an unsigned binary get the LocalAuthentication sheet? | **Yes.** An unsigned `cargo build` binary (ad-hoc, linker-signed) got the sheet both when spawned with no TTY and as a Claude Code stdio MCP child. The `osascript` typed-password fallback works without a TTY too. The suspected "Cancel recorded as SUCCESS" is **explained: not a fail-open**. The user pressed "Use Password…" and the Mac login password was verified (unified log). The FAIL path maps correctly in 15/15 no-UI probes. |
 | 2 | Can chromiumoxide drive installed Chrome over a pipe without `Runtime.enable`? | **No.** chromiumoxide 0.9.1 only does WebSocket and always sends `Runtime.enable`. A raw pipe client does all four things we need. |
 | 3 | What does each client do with a 40 s tool call? | All three return the 40 s result. Cursor cancels at **60 s**, Codex 0.165 at **300 s** (progress doesn't extend it). Claude Code headless didn't time out at 330 s. |
-| 4 | Does an "In production", unverified Gmail client keep its refresh token past 7 days? | _PENDING: needs the user to create the client; the day-8 result is filed later_ |
+| 4 | Does an "In production", unverified Gmail client keep its refresh token past 7 days? | **Deferred by the user** until the project is built end to end. The IMAP default stands. The `gmail-token` tool is ready on this branch. |
+
+---
+
+## 1. Approval popup (LocalAuthentication)
+
+**Setup.** `spikes/la-popup` uses objc2-local-authentication 0.3.2:
+- `canEvaluatePolicy` + `evaluatePolicy(.deviceOwnerAuthentication)`, with the reply block bridged to a channel. A 120 s timeout calls `invalidate()`.
+- The fallback is an `osascript` `display dialog … with hidden answer` that compares the typed value with the fake vault password `spike-vault`. It logs only the match result, never the typed text.
+- `la-popup mcp` serves `approve_touchid` and `approve_password` as an rmcp stdio server.
+- The binary is an unsigned debug build. `codesign -dv` shows `Signature=adhoc`, `flags=0x20002(adhoc,linker-signed)`, and no Developer ID.
+
+The lead session ran these on 2026-11-11 with the user at the Mac (Touch ID Mac, macOS 26.6.2). The ld-spikes code was unchanged.
+
+| Run | How it was started | Result |
+|---|---|---|
+| (a) `la-popup auth 2` | spawned from an agent shell, **no TTY** (`tty=false` in the log) | `canEvaluate=ok biometryType=LABiometryType(1)`. Attempt 1: `SUCCESS after 7348ms`. Attempt 2: `SUCCESS after 52783ms` (meant to be Cancel; the user approved instead) |
+| (b) `la-popup fallback` ×2 | same | Run 1: `PASSWORD_MISMATCH after 31189ms` (wrong text typed, correctly rejected). Run 2: `TIMED_OUT_OR_EMPTY after 873ms` (dialog dismissed at once, probably a held Enter) |
+| (c) as a Claude Code stdio MCP child | `claude -p --mcp-config <temp json> --strict-mcp-config --allowedTools mcp__lapopup__approve_touchid,mcp__lapopup__approve_password` | `approve_touchid` → `canEvaluate=ok biometryType=LABiometryType(1); SUCCESS after 34876ms`. `approve_password` → `PASSWORD_MATCH after 18271ms`. The server log shows ppid = the `claude` process and `tty=false`. |
+| (d) deny attempt, `la-popup auth 1` | same as (a) | `SUCCESS after 7728ms`. The user believed they clicked Cancel; the system log shows "Use Password…" followed by a verified Mac password (see below). |
+
+Log excerpt for (a) and (b), from `$TMPDIR/la-popup.log` (ld-spikes copy):
+
+```text
+15:51:58.723 pid=46336 ppid=46332 tty=false CHECK canEvaluate=ok biometryType=LABiometryType(1)
+15:52:06.083 pid=46336 ppid=46332 tty=false AUTH result: SUCCESS after 7348ms
+15:52:58.908 pid=46336 ppid=46332 tty=false AUTH result: SUCCESS after 52783ms
+15:53:36.023 pid=47481 ppid=47480 tty=false FALLBACK result: PASSWORD_MISMATCH after 31189ms
+15:53:45.169 pid=48331 ppid=48329 tty=false FALLBACK result: TIMED_OUT_OR_EMPTY after 873ms
+```
+
+**Findings**
+- **No -1000 on the first call.** The very first `evaluatePolicy` from a freshly built unsigned binary succeeded.
+- **No TTY or app bundle needed.** Every run had `tty=false`, including the MCP child. LocalAuthentication showed its system sheet anyway, so the daemon can call it directly. (a) was not run in an interactive terminal tab; the no-TTY and MCP-child cases are the harder ones, and both passed.
+- **An approval can take up to ~53 s.** That is already beyond the 40 s in-call budget (§3), so `awaiting_approval` + `wait(handle)` will happen in practice.
+- **Run (b)2 shows a held key can dismiss the fallback dialog in under 1 s.** The fallback must treat empty or instant answers as "no answer", never as approval. It did here (`TIMED_OUT_OR_EMPTY`).
+- **Every one of the four LA successes was approved with the Mac login password, never by Touch ID** (see the next section). That is valid for `.deviceOwnerAuthentication`, but it means the Touch ID path itself has not been exercised yet.
+
+### Resolved (was OPEN): "Cancel recorded as SUCCESS"
+
+**Claim:** the user clicked Cancel on the 15:55:31 sheet, yet `la-popup` logged `SUCCESS after 7728ms`. This was treated as a possible fail-open and investigated **without showing any more popups**.
+
+**Evidence 1: the macOS unified log** shows what the sheet actually did.
+
+Command:
+```text
+/usr/bin/log show --style compact --start '2026-11-11 15:55:31' --end '2026-11-11 15:55:41' \
+  --predicate 'subsystem BEGINSWITH "com.apple.LocalAuthentication" OR process CONTAINS "coreauth"'
+```
+
+Excerpt:
+```text
+15:55:31.906 coreauthd  MechanismWatch isAvailable -> Error … Code=-11 "No AppleWatch was discovered."
+15:55:32.054 coreautha  LAAuthBiometricsOrWatchDialogController cancel visible: 1, fallback visible: 1, show fallback immediately: 1
+15:55:33.832 coreauthd  MechanismUI[655](run) has received UI event 3 (FallbackButtonPressed)
+15:55:33.836 coreauthd  MechanismTouchId[652] has finished with Error … Code=-3 "Fallback authentication mechanism selected."
+15:55:39.556 coreautha  -[LAAuthPasscodeDialogController okClicked:]
+15:55:39.592 coreautha  MKB password verification for keybag 3 returned 0
+15:55:39.592 coreauthd  MechanismUI[655](run) has received UI event 8 (PasscodeVerified)
+15:55:39.594 coreauthd  -[MechanismUI uiSuccessWithResult:]
+```
+
+So the button pressed was **"Use Password…"**, not "Cancel". After that the user typed the **Mac login password**, and the system verified it before `la-popup` reported SUCCESS. The 15:52:02 and 15:52:11 runs show the same sequence: `FallbackButtonPressed` → `PasscodeVerified`. No Apple Watch is paired. The SUCCESS was a real, system-verified authentication, not a mis-decoded callback.
+
+**Evidence 2: no-UI FAIL-path probes** (`la-popup probe 5`). They use a fresh `LAContext` per call and read the reply's `BOOL` as a raw byte through an ABI-identical `(u8, *mut NSError)` block. On aarch64, objc2's `BOOL` is C `_Bool`.
+
+| Probe (×5 each) | Result, all 5 rounds |
+|---|---|
+| A `setInteractionNotAllowed(true)` | `raw_bool=0x00 as_bool=false`, `code=-1004 "User interaction required."`, 1–5 ms |
+| B `invalidate()` before evaluate | `raw_bool=0x00 as_bool=false`, `code=-10`, 0 ms |
+| C `.deviceOwnerAuthenticationWithWatch` (canEvaluate says no watch) | `raw_bool=0x00 as_bool=false`, `code=-11 "No companion device was discovered."` |
+
+Across all 15 calls:
+- the reply block fired **exactly once** (`reply calls=1 extra=[]`, checked 500 ms after the first reply)
+- `touchIDAuthenticationAllowableReuseDuration` was `0`, so no reuse of an earlier unlock is possible
+- the unified log shows **0** `showing UI` / `DidAppear` events in the probe window, so no sheet was shown
+
+`auth_once` already creates a new `LAContext` for every call.
+
+**Not checked:** the raw byte on a real Touch ID success (that would need a popup). The system log shows those successes were real on the OS side.
+
+**What Phase 4's approver must do anyway:**
+1. Approve **only** if the reply has `success == true` **and** `error == nil`, on a **fresh** `LAContext` created for that one request, with `touchIDAuthenticationAllowableReuseDuration = 0`. Read the `BOOL` through objc2's `Bool`. Anything else is a deny: any error, a missing reply, a timeout, a second reply, or a reply for another context.
+2. Expect the Mac password path. `.deviceOwnerAuthentication` shows **"Use Password…" next to "Cancel" immediately** (`show fallback immediately: 1`), and the user pressed it every time thinking it was Cancel. The approval text must say clearly that typing the Mac password **approves**. If "Touch ID only" approvals are ever wanted, use `.deviceOwnerAuthenticationWithBiometrics` and accept that Macs without Touch ID then need the vault-password fallback.
+3. Map errors to statuses: `-2 userCancel`, `-4 systemCancel`, `-9 appCancel`, `-1` and `-3` → `denied`; `-1004` (no UI possible) → `needs_user`; `-10` → internal error, never approve.
+4. Treat an empty or instant (<1 s) answer in the typed vault-password fallback as "no answer", as run (b)2 did.
+
+**Spike 1 is closed (lead decision, 2026-11-11).** No more popups. The Cancel code stays *expected (`-2 userCancel`), unrecorded*, and a real Touch ID approval is unrecorded too. Phase 4 follows the rule above.
 
 ---
 
@@ -99,95 +186,17 @@ Server log excerpts:
 
 ---
 
-## 1. Approval popup (LocalAuthentication)
-
-**Setup.** `spikes/la-popup` uses objc2-local-authentication 0.3.2:
-- `canEvaluatePolicy` + `evaluatePolicy(.deviceOwnerAuthentication)`, with the reply block bridged to a channel. A 120 s timeout calls `invalidate()`.
-- The fallback is an `osascript` `display dialog … with hidden answer` that compares the typed value with the fake vault password `spike-vault`. It logs only the match result, never the typed text.
-- `la-popup mcp` serves `approve_touchid` and `approve_password` as an rmcp stdio server.
-- The binary is an unsigned debug build. `codesign -dv` shows `Signature=adhoc`, `flags=0x20002(adhoc,linker-signed)`, and no Developer ID.
-
-The lead session ran these on 2026-11-11 with the user at the Mac (Touch ID Mac, macOS 26.6.2). The ld-spikes code was unchanged.
-
-| Run | How it was started | Result |
-|---|---|---|
-| (a) `la-popup auth 2` | spawned from an agent shell, **no TTY** (`tty=false` in the log) | `canEvaluate=ok biometryType=LABiometryType(1)`. Attempt 1: `SUCCESS after 7348ms`. Attempt 2: `SUCCESS after 52783ms` (meant to be Cancel; the user approved instead) |
-| (b) `la-popup fallback` ×2 | same | Run 1: `PASSWORD_MISMATCH after 31189ms` (wrong text typed, correctly rejected). Run 2: `TIMED_OUT_OR_EMPTY after 873ms` (dialog dismissed at once, probably a held Enter) |
-| (c) as a Claude Code stdio MCP child | `claude -p --mcp-config <temp json> --strict-mcp-config --allowedTools mcp__lapopup__approve_touchid,mcp__lapopup__approve_password` | `approve_touchid` → `canEvaluate=ok biometryType=LABiometryType(1); SUCCESS after 34876ms`. `approve_password` → `PASSWORD_MATCH after 18271ms`. The server log shows ppid = the `claude` process and `tty=false`. |
-| (d) deny attempt, `la-popup auth 1` | same as (a) | `SUCCESS after 7728ms`. The user believed they clicked Cancel; the system log shows "Use Password…" followed by a verified Mac password (see below). |
-
-Log excerpt for (a) and (b), from `$TMPDIR/la-popup.log` (ld-spikes copy):
-
-```text
-15:51:58.723 pid=46336 ppid=46332 tty=false CHECK canEvaluate=ok biometryType=LABiometryType(1)
-15:52:06.083 pid=46336 ppid=46332 tty=false AUTH result: SUCCESS after 7348ms
-15:52:58.908 pid=46336 ppid=46332 tty=false AUTH result: SUCCESS after 52783ms
-15:53:36.023 pid=47481 ppid=47480 tty=false FALLBACK result: PASSWORD_MISMATCH after 31189ms
-15:53:45.169 pid=48331 ppid=48329 tty=false FALLBACK result: TIMED_OUT_OR_EMPTY after 873ms
-```
-
-**Findings**
-- **No -1000 on the first call.** The very first `evaluatePolicy` from a freshly built unsigned binary succeeded.
-- **No TTY or app bundle needed.** Every run had `tty=false`, including the MCP child. LocalAuthentication showed its system sheet anyway, so the daemon can call it directly. (a) was not run in an interactive terminal tab; the no-TTY and MCP-child cases are the harder ones, and both passed.
-- **An approval can take up to ~53 s.** That is already beyond the 40 s in-call budget (§3), so `awaiting_approval` + `wait(handle)` will happen in practice.
-- **Run (b)2 shows a held key can dismiss the fallback dialog in under 1 s.** The fallback must treat empty or instant answers as "no answer", never as approval. It did here (`TIMED_OUT_OR_EMPTY`).
-- **Every one of the four LA successes was approved with the Mac login password, never by Touch ID** (see the next section). That is valid for `.deviceOwnerAuthentication`, but it means the Touch ID path itself has not been exercised yet.
-
-### Resolved (was OPEN): "Cancel recorded as SUCCESS"
-
-**Claim:** the user clicked Cancel on the 15:55:31 sheet, yet `la-popup` logged `SUCCESS after 7728ms`. This was treated as a possible fail-open and investigated **without showing any more popups**.
-
-**Evidence 1: the macOS unified log** shows what the sheet actually did.
-
-Command:
-```text
-/usr/bin/log show --style compact --start '2026-11-11 15:55:31' --end '2026-11-11 15:55:41' \
-  --predicate 'subsystem BEGINSWITH "com.apple.LocalAuthentication" OR process CONTAINS "coreauth"'
-```
-
-Excerpt:
-```text
-15:55:31.906 coreauthd  MechanismWatch isAvailable -> Error … Code=-11 "No AppleWatch was discovered."
-15:55:32.054 coreautha  LAAuthBiometricsOrWatchDialogController cancel visible: 1, fallback visible: 1, show fallback immediately: 1
-15:55:33.832 coreauthd  MechanismUI[655](run) has received UI event 3 (FallbackButtonPressed)
-15:55:33.836 coreauthd  MechanismTouchId[652] has finished with Error … Code=-3 "Fallback authentication mechanism selected."
-15:55:39.556 coreautha  -[LAAuthPasscodeDialogController okClicked:]
-15:55:39.592 coreautha  MKB password verification for keybag 3 returned 0
-15:55:39.592 coreauthd  MechanismUI[655](run) has received UI event 8 (PasscodeVerified)
-15:55:39.594 coreauthd  -[MechanismUI uiSuccessWithResult:]
-```
-
-So the button pressed was **"Use Password…"**, not "Cancel". After that the user typed the **Mac login password**, and the system verified it before `la-popup` reported SUCCESS. The 15:52:02 and 15:52:11 runs show the same sequence: `FallbackButtonPressed` → `PasscodeVerified`. No Apple Watch is paired. The SUCCESS was a real, system-verified authentication, not a mis-decoded callback.
-
-**Evidence 2: no-UI FAIL-path probes** (`la-popup probe 5`). They use a fresh `LAContext` per call and read the reply's `BOOL` as a raw byte through an ABI-identical `(u8, *mut NSError)` block. On aarch64, objc2's `BOOL` is C `_Bool`.
-
-| Probe (×5 each) | Result, all 5 rounds |
-|---|---|
-| A `setInteractionNotAllowed(true)` | `raw_bool=0x00 as_bool=false`, `code=-1004 "User interaction required."`, 1–5 ms |
-| B `invalidate()` before evaluate | `raw_bool=0x00 as_bool=false`, `code=-10`, 0 ms |
-| C `.deviceOwnerAuthenticationWithWatch` (canEvaluate says no watch) | `raw_bool=0x00 as_bool=false`, `code=-11 "No companion device was discovered."` |
-
-Across all 15 calls:
-- the reply block fired **exactly once** (`reply calls=1 extra=[]`, checked 500 ms after the first reply)
-- `touchIDAuthenticationAllowableReuseDuration` was `0`, so no reuse of an earlier unlock is possible
-- the unified log shows **0** `showing UI` / `DidAppear` events in the probe window, so no sheet was shown
-
-`auth_once` already creates a new `LAContext` for every call.
-
-**Not checked:** the raw byte on a real Touch ID success (that would need a popup). The system log shows those successes were real on the OS side.
-
-**What Phase 4's approver must do anyway:**
-1. Approve **only** if the reply has `success == true` **and** `error == nil`, on a **fresh** `LAContext` created for that one request, with `touchIDAuthenticationAllowableReuseDuration = 0`. Read the `BOOL` through objc2's `Bool`. Anything else is a deny: any error, a missing reply, a timeout, a second reply, or a reply for another context.
-2. Expect the Mac password path. `.deviceOwnerAuthentication` shows **"Use Password…" next to "Cancel" immediately** (`show fallback immediately: 1`), and the user pressed it every time thinking it was Cancel. The approval text must say clearly that typing the Mac password **approves**. If "Touch ID only" approvals are ever wanted, use `.deviceOwnerAuthenticationWithBiometrics` and accept that Macs without Touch ID then need the vault-password fallback.
-3. Map errors to statuses: `-2 userCancel`, `-4 systemCancel`, `-9 appCancel`, `-1` and `-3` → `denied`; `-1004` (no UI possible) → `needs_user`; `-10` → internal error, never approve.
-4. Treat an empty or instant (<1 s) answer in the typed vault-password fallback as "no answer", as run (b)2 did.
-
-**Still open (optional, needs the user):** one real **Cancel** press to record its code (expected `-2`), and one **Touch ID** approval.
----
-
 ## 4. Gmail refresh-token lifetime
 
-_PENDING_
+**Status: deferred by the user (2026-11-11)** until logindesk is built end to end. No Google Cloud client was created, no token was minted and no launchd job was installed.
+
+What is ready on `spike/phase0`, for when it resumes:
+- `spikes/gmail-token`: `login <client_secret.json>` runs a loopback (`127.0.0.1:<random>`) + PKCE S256 consent for `gmail.readonly` (`access_type=offline`, `prompt=consent`). It verifies `state` and stores the refresh token in `~/Library/Application Support/logindesk-spike/gmail-token.json` (dir 0700, file 0600, outside the repo).
+- `check` refreshes the token, calls `users.getProfile`, and appends one timestamped line to `check.log`, e.g. `CHECK ok refresh=ok token_age=…d` or `CHECK FAIL … server_error=invalid_grant`. It never prints a token, the client secret or the address.
+- The Google Cloud steps (project → Gmail API → Google Auth Platform, External → **Publish app: In production**, unverified → `gmail.readonly` → Desktop client) are in the lead's notes. They go into `docs/` with Phase 8.
+- Built and run without a token: `gmail-token check` → `no token yet; run gmail-token login <client.json> first`.
+
+**Consequence:** the 7-day question stays open. The build plan's IMAP (app password) default stands, and Gmail REST stays the opt-in backend. The Phase 3 test bed's Gmail-REST mock covers the code path without a real token.
 
 ---
 
@@ -207,4 +216,14 @@ The popup spike (§1) wrote no client config: the lead ran it with `claude -p --
 
 ## Decisions this implies
 
-_PENDING_
+| Phase | Decision | Why (evidence above) |
+|---|---|---|
+| **4 — approver** | macOS LocalAuthentication `.deviceOwnerAuthentication` from the **unsigned** daemon is the primary approver. The `osascript` hidden-answer vault-password dialog is the fallback. | §1: the sheet works with no TTY, from an unsigned binary, and as a Claude Code stdio child; the fallback works without a TTY. |
+| 4 — approver rule | Approve **only** on `success == true && error == nil` from a **fresh** `LAContext` per request, with reuse duration 0. Everything else is a deny: errors, timeout, missing or second reply. `-1004` → `needs_user`. An empty or instant fallback answer = no answer. | §1: FAIL path mapped correctly in 15/15 no-UI probes, with exactly one reply each. |
+| 4 — approval text | The sheet offers **"Use Password…" next to "Cancel" from the start**. Typing the Mac password approves. The reason string must say so. Touch ID-only would need `.deviceOwnerAuthenticationWithBiometrics`. | §1: every test approval went through "Use Password…" while the user believed they were cancelling. |
+| 4 / 6 — long approvals | Block for at most **40 s**, sending progress; then return `awaiting_approval` + handle and let the agent call `wait`. | §3: Cursor hard-cancels at **60 s**; Codex 0.165 at **300 s** (progress doesn't extend it); Claude Code headless survived 330 s. A real approval took 53 s in §1. |
+| **5 — CDP transport** | **Our own minimal CDP client over `--remote-debugging-pipe`** (fd 3/4, NUL-delimited JSON). No TCP port, never `Runtime.enable`. Not chromiumoxide. Launch with `--disable-blink-features=AutomationControlled`. Fill with `DOM.focus` + `Input.insertText`; snapshot with `Accessibility.getFullAXTree`. | §2: chromiumoxide 0.9.1 is WebSocket-only and always enables Runtime; the ~200-line pipe client did everything needed, also under `de-DE`. |
+| 5 — snapshot masking | Mask password values to a **fixed-width** placeholder; Chrome's AX tree shows one `•` per character, which leaks the length. Set the locale with `--accept-lang`; `--lang` does nothing on macOS. | §2. |
+| 10 — client config | `connect codex` writes `default_tools_approval_mode = "approve"` for logindesk's server. `connect cursor` documents (or writes, with consent) the `Mcp(logindesk:*)` allow rule. | §3: without them, headless Codex and Cursor refuse the call. |
+| **8 — mail** | **IMAP with an app password stays the default.** Gmail REST stays opt-in until spike 4 has its day-8 result. | §4: deferred by the user. |
+
