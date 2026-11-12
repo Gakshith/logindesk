@@ -68,10 +68,14 @@ jobs:
             grep -q '^workspace = true' "$f" || { echo "::error file=$f::must inherit [lints] workspace = true"; exit 1; }
           done
           grep -q '^unsafe_code = "deny"' crates/vault/Cargo.toml || { echo "::error::vault must deny unsafe_code"; exit 1; }
-          # The only allow(unsafe_code) in the tree is the hardening module.
-          hits=$(grep -rn --include='*.rs' 'allow(unsafe_code)' crates testbed | grep -v '^crates/vault/src/lib.rs:.*mod hardening' || true)
-          if [ -n "$hits" ]; then echo "::error::unexpected allow(unsafe_code):"; echo "$hits"; exit 1; fi
-          grep -n 'unsafe' crates/vault/src/*.rs | grep -v '^crates/vault/src/hardening.rs' | grep -v 'unsafe_code' && { echo "::error::unsafe outside hardening.rs"; exit 1; } || true
+          # Exactly one allow(unsafe_code) in the tree, directly on `pub mod hardening;` in vault.
+          hits=$(grep -rn --include='*.rs' 'allow(unsafe_code)' crates testbed || true)
+          [ "$(printf '%s\n' "$hits" | grep -c .)" = 1 ] && printf '%s\n' "$hits" | grep -q '^crates/vault/src/lib.rs:' \
+            && grep -A1 'allow(unsafe_code)' crates/vault/src/lib.rs | grep -q '^pub mod hardening;$' \
+            || { echo "::error::unexpected allow(unsafe_code):"; echo "$hits"; exit 1; }
+          # No unsafe block, fn, impl or extern anywhere else.
+          other=$(grep -rnE --include='*.rs' '\bunsafe[[:space:]]*(\{|fn|impl|extern)' crates testbed | grep -v '^crates/vault/src/hardening.rs:' || true)
+          [ -z "$other" ] || { echo "::error::unsafe outside crates/vault/src/hardening.rs:"; echo "$other"; exit 1; }
 
   supply-chain:
     name: cargo deny · cargo audit

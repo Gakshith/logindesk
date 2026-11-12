@@ -32,6 +32,8 @@ ignore = true
 [bans]
 multiple-versions = "warn"
 wildcards = "deny"
+# Path dependencies between our own unpublished crates have no version.
+allow-wildcard-paths = true
 # No OpenSSL anywhere in the tree (build plan §1: no C toolchain needed).
 deny = [
     { crate = "openssl" },

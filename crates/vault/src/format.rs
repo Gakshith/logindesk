@@ -47,7 +47,7 @@ impl KdfParams {
     /// Mac. See `docs/crypto-spec.md` for the measurement and the OWASP check.
     pub const DEFAULT: Self = Self {
         m_kib: 256 * 1024,
-        t: 3,
+        t: 2,
         p: 1,
     };
     /// The OWASP Password Storage Cheat Sheet minimum (19 MiB, t=2, p=1).
