@@ -108,6 +108,57 @@ pub fn fallback(reason: &str) -> String {
     res
 }
 
+/// No-UI probes of the FAIL path (spike 1 follow-up). Never shows a sheet:
+///   A: interactionNotAllowed = true  → expect LAError -1004 (notInteractive)
+///   B: invalidate() before evaluate  → expect LAError -10 (invalidContext)
+///   C: DeviceOwnerAuthenticationWithWatch, only if canEvaluate says no watch → expect -11
+/// Logs the raw reply byte, how many times the reply block fired, and the reuse duration.
+pub fn probe(rounds: usize) {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    for round in 1..=rounds {
+        for (name, policy, setup) in [
+            ("A interactionNotAllowed", LAPolicy::DeviceOwnerAuthentication, 0u8),
+            ("B invalidated-before-evaluate", LAPolicy::DeviceOwnerAuthentication, 1),
+            ("C watch-policy-without-watch", LAPolicy::DeviceOwnerAuthenticationWithWatch, 2),
+        ] {
+            let ctx = unsafe { LAContext::new() };
+            let reuse = unsafe { ctx.touchIDAuthenticationAllowableReuseDuration() };
+            match setup {
+                0 => unsafe { ctx.setInteractionNotAllowed(true) },
+                1 => unsafe { ctx.invalidate() },
+                _ => {
+                    if unsafe { ctx.canEvaluatePolicy_error(policy) }.is_ok() {
+                        log(format!("PROBE r{round} {name}: SKIPPED (a watch is available; evaluating could prompt it)"));
+                        continue;
+                    }
+                }
+            }
+            let calls = Arc::new(AtomicUsize::new(0));
+            let (tx, rx) = mpsc::channel::<String>();
+            let c2 = calls.clone();
+            // Same ABI as (Bool, *mut NSError) on aarch64 (BOOL = C _Bool, one byte); read it raw.
+            let raw_block = RcBlock::new(move |raw: u8, err: *mut NSError| {
+                let n = c2.fetch_add(1, Ordering::SeqCst) + 1;
+                let e = unsafe { err.as_ref() }.map(err_str).unwrap_or_else(|| "none".into());
+                let _ = tx.send(format!("call#{n} raw_bool=0x{raw:02x} as_bool={} err={e}", Bool::new(raw != 0).as_bool()));
+            });
+            let block: &block2::DynBlock<dyn Fn(Bool, *mut NSError)> =
+                unsafe { &*(&*raw_block as *const block2::DynBlock<dyn Fn(u8, *mut NSError)> as *const block2::DynBlock<dyn Fn(Bool, *mut NSError)>) };
+            let t = Instant::now();
+            unsafe { ctx.evaluatePolicy_localizedReason_reply(policy, &NSString::from_str("logindesk spike probe (should never be shown)"), block) };
+            let first = rx.recv_timeout(Duration::from_secs(5)).unwrap_or_else(|_| "NO REPLY in 5s".into());
+            let ms = t.elapsed().as_millis();
+            std::thread::sleep(Duration::from_millis(500)); // catch a second reply, if any
+            let later: Vec<String> = rx.try_iter().collect();
+            log(format!(
+                "PROBE r{round} {name}: {first} after {ms}ms; reply calls={} extra={later:?} reuseDuration={reuse}",
+                calls.load(Ordering::SeqCst)
+            ));
+        }
+    }
+}
+
 mod mcp {
     use rmcp::{tool, tool_router, ServiceExt};
 
@@ -160,6 +211,11 @@ async fn main() -> anyhow::Result<()> {
         }
         Some("fallback") => {
             fallback("Approve a TEST login to example.test (logindesk spike)");
+        }
+        Some("probe") => {
+            let n: usize = args.get(2).and_then(|s| s.parse().ok()).unwrap_or(5);
+            check();
+            probe(n);
         }
         Some("mcp") => mcp::serve().await?,
         _ => eprintln!("usage: la-popup check | auth [n] | fallback | mcp"),

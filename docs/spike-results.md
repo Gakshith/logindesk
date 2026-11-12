@@ -5,7 +5,7 @@ Spike code: branch `spike/phase0`, folder `spikes/` (four standalone throwaway c
 
 | # | Question | Answer |
 |---|---|---|
-| 1 | Does an unsigned binary get the LocalAuthentication sheet? | **Yes.** An unsigned `cargo build` binary (ad-hoc, linker-signed) got the sheet both when spawned with no TTY and as a Claude Code stdio MCP child. The `osascript` typed-password fallback works without a TTY too. **Deny/Cancel has not been recorded yet.** |
+| 1 | Does an unsigned binary get the LocalAuthentication sheet? | **Yes.** An unsigned `cargo build` binary (ad-hoc, linker-signed) got the sheet both when spawned with no TTY and as a Claude Code stdio MCP child. The `osascript` typed-password fallback works without a TTY too. The suspected "Cancel recorded as SUCCESS" is **explained: not a fail-open**. The user pressed "Use Password…" and the Mac login password was verified (unified log). The FAIL path maps correctly in 15/15 no-UI probes. |
 | 2 | Can chromiumoxide drive installed Chrome over a pipe without `Runtime.enable`? | **No.** chromiumoxide 0.9.1 only does WebSocket and always sends `Runtime.enable`. A raw pipe client does all four things we need. |
 | 3 | What does each client do with a 40 s tool call? | All three return the 40 s result. Cursor cancels at **60 s**, Codex 0.165 at **300 s** (progress doesn't extend it). Claude Code headless didn't time out at 330 s. |
 | 4 | Does an "In production", unverified Gmail client keep its refresh token past 7 days? | _PENDING: needs the user to create the client; the day-8 result is filed later_ |
@@ -114,7 +114,7 @@ The lead session ran these on 2026-11-11 with the user at the Mac (Touch ID Mac,
 | (a) `la-popup auth 2` | spawned from an agent shell, **no TTY** (`tty=false` in the log) | `canEvaluate=ok biometryType=LABiometryType(1)`. Attempt 1: `SUCCESS after 7348ms`. Attempt 2: `SUCCESS after 52783ms` (meant to be Cancel; the user approved instead) |
 | (b) `la-popup fallback` ×2 | same | Run 1: `PASSWORD_MISMATCH after 31189ms` (wrong text typed, correctly rejected). Run 2: `TIMED_OUT_OR_EMPTY after 873ms` (dialog dismissed at once, probably a held Enter) |
 | (c) as a Claude Code stdio MCP child | `claude -p --mcp-config <temp json> --strict-mcp-config --allowedTools mcp__lapopup__approve_touchid,mcp__lapopup__approve_password` | `approve_touchid` → `canEvaluate=ok biometryType=LABiometryType(1); SUCCESS after 34876ms`. `approve_password` → `PASSWORD_MATCH after 18271ms`. The server log shows ppid = the `claude` process and `tty=false`. |
-| (d) deny attempt, `la-popup auth 1` | same as (a) | `SUCCESS after 7728ms`. Cancel was **not** recorded; the lead is asking the user whether an Apple Watch or Touch ID approved it. |
+| (d) deny attempt, `la-popup auth 1` | same as (a) | `SUCCESS after 7728ms`. The user believed they clicked Cancel; the system log shows "Use Password…" followed by a verified Mac password (see below). |
 
 Log excerpt for (a) and (b), from `$TMPDIR/la-popup.log` (ld-spikes copy):
 
@@ -131,11 +131,58 @@ Log excerpt for (a) and (b), from `$TMPDIR/la-popup.log` (ld-spikes copy):
 - **No TTY or app bundle needed.** Every run had `tty=false`, including the MCP child. LocalAuthentication showed its system sheet anyway, so the daemon can call it directly. (a) was not run in an interactive terminal tab; the no-TTY and MCP-child cases are the harder ones, and both passed.
 - **An approval can take up to ~53 s.** That is already beyond the 40 s in-call budget (§3), so `awaiting_approval` + `wait(handle)` will happen in practice.
 - **Run (b)2 shows a held key can dismiss the fallback dialog in under 1 s.** The fallback must treat empty or instant answers as "no answer", never as approval. It did here (`TIMED_OUT_OR_EMPTY`).
-- **Still open:**
-  - the deny / Cancel error code (expected `LAError.userCancel`, -2)
-  - whether an Apple Watch can satisfy `.deviceOwnerAuthentication` (it can by design if one is paired; that matters for "a computer-use agent can't click approve")
-  - one run from an interactive terminal tab
+- **Every one of the four LA successes was approved with the Mac login password, never by Touch ID** (see the next section). That is valid for `.deviceOwnerAuthentication`, but it means the Touch ID path itself has not been exercised yet.
 
+### Resolved (was OPEN): "Cancel recorded as SUCCESS"
+
+**Claim:** the user clicked Cancel on the 15:55:31 sheet, yet `la-popup` logged `SUCCESS after 7728ms`. This was treated as a possible fail-open and investigated **without showing any more popups**.
+
+**Evidence 1: the macOS unified log** shows what the sheet actually did.
+
+Command:
+```text
+/usr/bin/log show --style compact --start '2026-11-11 15:55:31' --end '2026-11-11 15:55:41' \
+  --predicate 'subsystem BEGINSWITH "com.apple.LocalAuthentication" OR process CONTAINS "coreauth"'
+```
+
+Excerpt:
+```text
+15:55:31.906 coreauthd  MechanismWatch isAvailable -> Error … Code=-11 "No AppleWatch was discovered."
+15:55:32.054 coreautha  LAAuthBiometricsOrWatchDialogController cancel visible: 1, fallback visible: 1, show fallback immediately: 1
+15:55:33.832 coreauthd  MechanismUI[655](run) has received UI event 3 (FallbackButtonPressed)
+15:55:33.836 coreauthd  MechanismTouchId[652] has finished with Error … Code=-3 "Fallback authentication mechanism selected."
+15:55:39.556 coreautha  -[LAAuthPasscodeDialogController okClicked:]
+15:55:39.592 coreautha  MKB password verification for keybag 3 returned 0
+15:55:39.592 coreauthd  MechanismUI[655](run) has received UI event 8 (PasscodeVerified)
+15:55:39.594 coreauthd  -[MechanismUI uiSuccessWithResult:]
+```
+
+So the button pressed was **"Use Password…"**, not "Cancel". After that the user typed the **Mac login password**, and the system verified it before `la-popup` reported SUCCESS. The 15:52:02 and 15:52:11 runs show the same sequence: `FallbackButtonPressed` → `PasscodeVerified`. No Apple Watch is paired. The SUCCESS was a real, system-verified authentication, not a mis-decoded callback.
+
+**Evidence 2: no-UI FAIL-path probes** (`la-popup probe 5`). They use a fresh `LAContext` per call and read the reply's `BOOL` as a raw byte through an ABI-identical `(u8, *mut NSError)` block. On aarch64, objc2's `BOOL` is C `_Bool`.
+
+| Probe (×5 each) | Result, all 5 rounds |
+|---|---|
+| A `setInteractionNotAllowed(true)` | `raw_bool=0x00 as_bool=false`, `code=-1004 "User interaction required."`, 1–5 ms |
+| B `invalidate()` before evaluate | `raw_bool=0x00 as_bool=false`, `code=-10`, 0 ms |
+| C `.deviceOwnerAuthenticationWithWatch` (canEvaluate says no watch) | `raw_bool=0x00 as_bool=false`, `code=-11 "No companion device was discovered."` |
+
+Across all 15 calls:
+- the reply block fired **exactly once** (`reply calls=1 extra=[]`, checked 500 ms after the first reply)
+- `touchIDAuthenticationAllowableReuseDuration` was `0`, so no reuse of an earlier unlock is possible
+- the unified log shows **0** `showing UI` / `DidAppear` events in the probe window, so no sheet was shown
+
+`auth_once` already creates a new `LAContext` for every call.
+
+**Not checked:** the raw byte on a real Touch ID success (that would need a popup). The system log shows those successes were real on the OS side.
+
+**What Phase 4's approver must do anyway:**
+1. Approve **only** if the reply has `success == true` **and** `error == nil`, on a **fresh** `LAContext` created for that one request, with `touchIDAuthenticationAllowableReuseDuration = 0`. Read the `BOOL` through objc2's `Bool`. Anything else is a deny: any error, a missing reply, a timeout, a second reply, or a reply for another context.
+2. Expect the Mac password path. `.deviceOwnerAuthentication` shows **"Use Password…" next to "Cancel" immediately** (`show fallback immediately: 1`), and the user pressed it every time thinking it was Cancel. The approval text must say clearly that typing the Mac password **approves**. If "Touch ID only" approvals are ever wanted, use `.deviceOwnerAuthenticationWithBiometrics` and accept that Macs without Touch ID then need the vault-password fallback.
+3. Map errors to statuses: `-2 userCancel`, `-4 systemCancel`, `-9 appCancel`, `-1` and `-3` → `denied`; `-1004` (no UI possible) → `needs_user`; `-10` → internal error, never approve.
+4. Treat an empty or instant (<1 s) answer in the typed vault-password fallback as "no answer", as run (b)2 did.
+
+**Still open (optional, needs the user):** one real **Cancel** press to record its code (expected `-2`), and one **Touch ID** approval.
 ---
 
 ## 4. Gmail refresh-token lifetime
