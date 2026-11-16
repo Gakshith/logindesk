@@ -28,7 +28,7 @@ csv = { version = "=1.4.0" }
 # Dev only.
 proptest = { version = "=1.12.0" }
 
-# testbed only (Phase 3). Never a dependency of crates/*.
+# Shared async/JSON (testbed, daemon, mcp).
 axum = { version = "=0.8.9" }
 tokio = { version = "=1.54.1" }
 serde = { version = "=1.0.229", features = ["derive"] }
@@ -40,6 +40,19 @@ sha1 = { version = "=0.11.0" }
 tempfile = { version = "=3.27.0" }
 tower = { version = "=0.5.3" }
 http-body-util = { version = "=0.1.5" }
+
+# Policy / executor / mail.
+psl = { version = "=2.1.255" }
+url = { version = "=2.5.8" }
+ureq = { version = "=3.5.1", default-features = false }
+# MCP server.
+rmcp = { version = "=3.9.0", features = ["server", "transport-io", "macros"] }
+schemars = { version = "=1.2.3" }
+# Approver (macOS LocalAuthentication).
+objc2 = { version = "=0.6.5" }
+objc2-foundation = { version = "=0.3.2" }
+objc2-local-authentication = { version = "=0.3.2" }
+block2 = { version = "=0.6.2" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

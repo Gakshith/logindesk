@@ -1,12 +1,16 @@
 [package]
 name = "logindesk-mail"
-description = "Mail sources and OTP parsing for logindesk (skeleton)."
+description = "Mail sources and the OTP parser for logindesk."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+logindesk-core = { path = "../core" }
+logindesk-policy = { path = "../policy" }
 
 [lints]
 workspace = true
