@@ -6,9 +6,9 @@
 //! which writes to a file, never to a stream.
 #![forbid(unsafe_code)]
 
+mod connect;
 mod doctor;
 mod install;
-mod connect;
 mod paths;
 mod prompt;
 
@@ -252,11 +252,15 @@ enum VaultCmd {
         #[arg(long)]
         plaintext: bool,
     },
-    /// Import logins from a CSV export (Chrome, Firefox, Safari, Bitwarden, 1Password).
+    /// Import logins from a CSV export (Google Password Manager / Chrome, Firefox, Safari,
+    /// Bitwarden, 1Password).
     Import {
         /// The CSV file.
         #[arg(long)]
         csv: PathBuf,
+        /// After a successful import, overwrite the plaintext CSV with zeros and delete it.
+        #[arg(long)]
+        delete_csv: bool,
     },
 }
 
@@ -671,7 +675,7 @@ fn vault_cmd(
                 file.display()
             );
         }
-        VaultCmd::Import { csv } => {
+        VaultCmd::Import { csv, delete_csv } => {
             let rows = logindesk_vault::parse_import_csv(std::fs::File::open(&csv)?)?;
             let n = rows.len();
             for row in rows {
@@ -687,11 +691,34 @@ fn vault_cmd(
                     },
                 )?;
             }
-            eprintln!(
-                "Imported {n} login(s). The CSV still holds them in plaintext: delete {} now.",
-                csv.display()
-            );
+            if delete_csv {
+                wipe_file(&csv)?;
+                eprintln!("Imported {n} login(s). The plaintext CSV was overwritten and deleted.");
+            } else {
+                eprintln!(
+                    "Imported {n} login(s). The CSV still holds them in plaintext: delete {} now \
+                     (or import with --delete-csv).",
+                    csv.display()
+                );
+            }
         }
     }
     Ok(())
+}
+
+/// Overwrite a file with zeros, flush it to disk, then delete it. Best effort against
+/// casual recovery (SSDs and APFS snapshots may still keep old blocks).
+fn wipe_file(path: &Path) -> std::io::Result<()> {
+    let len = std::fs::metadata(path)?.len();
+    let mut f = std::fs::OpenOptions::new().write(true).open(path)?;
+    let zeros = vec![0u8; 64 * 1024];
+    let mut left = len;
+    while left > 0 {
+        let n = left.min(zeros.len() as u64) as usize;
+        f.write_all(&zeros[..n])?;
+        left -= n as u64;
+    }
+    f.sync_all()?;
+    drop(f);
+    std::fs::remove_file(path)
 }
