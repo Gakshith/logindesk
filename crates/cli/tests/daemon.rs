@@ -349,14 +349,53 @@ fn daemon_serves_cli_and_mcp_and_never_leaks() {
         [
             "click",
             "close_session",
+            "fill_secret",
             "list_accounts",
             "login",
             "navigate",
+            "open",
+            "press_enter",
             "signup",
             "snapshot",
+            "type",
             "wait"
         ]
     );
+    // The new tools steer the agent: snapshot first, type only non-secrets,
+    // fill_secret for passwords/codes/email, never ask the user for a secret.
+    let desc = |name: &str| {
+        tools["result"]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["name"] == name)
+            .unwrap()["description"]
+            .as_str()
+            .unwrap()
+            .replace('\n', " ")
+    };
+    let ty = desc("type");
+    assert!(
+        ty.contains("snapshot") && ty.contains("fill_secret") && ty.contains("Never ask the user"),
+        "{ty}"
+    );
+    let fs = desc("fill_secret");
+    assert!(
+        fs.contains("snapshot") && fs.contains("new_password") && fs.contains("never ask the user"),
+        "{fs}"
+    );
+    assert!(desc("login").contains("field_mapping_failed"));
+    assert!(desc("signup").contains("fill_secret"));
+    let schema = tools["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|t| t["name"] == "fill_secret")
+        .unwrap()["inputSchema"]
+        .to_string();
+    for k in ["password", "new_password", "email", "code"] {
+        assert!(schema.contains(&format!("\"{k}\"")), "{schema}");
+    }
     for t in tools["result"]["tools"].as_array().unwrap() {
         let d = t["description"].as_str().unwrap().replace('\n', " ");
         assert!(
