@@ -16,7 +16,9 @@
 pub mod audit;
 pub mod broker;
 pub mod browser;
+pub mod identity;
 pub mod mailcfg;
+pub mod password;
 pub mod proto;
 pub mod server;
 

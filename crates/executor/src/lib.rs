@@ -76,6 +76,13 @@ pub enum PageState {
     Captcha,
     /// A login form (username/password) is showing.
     LoginForm,
+    /// A signup form (a new-password field) is showing, e.g. back with an error.
+    SignupForm,
+    /// "Check your email": the site sent a verification mail and shows no code field.
+    VerifyEmail,
+    /// Fields are filled but a required checkbox (terms, consent) is unticked.
+    /// The broker never ticks one; the user must, then submit.
+    NeedsConsent,
     /// Anything else.
     Unknown,
 }
@@ -122,6 +129,28 @@ const USER_FIELDS: &[&str] = &[
      input[name*=login i]:not([type=hidden]):not([type=password]), \
      input[id*=login i]:not([type=hidden]):not([type=password])",
     "input[type=text i], input:not([type])",
+];
+
+/// The new-password field of a signup form, most specific first.
+const NEW_PW: &str = "input[autocomplete~=new-password i]";
+/// Email field of a signup form.
+const EMAIL_FIELDS: &[&str] = &[
+    "input[autocomplete~=email i]:not([type=hidden])",
+    "input[type=email i]",
+    "input[name*=email i]:not([type=hidden]):not([type=password]), \
+     input[id*=email i]:not([type=hidden]):not([type=password])",
+];
+/// Full-name field of a signup form (`~=` is a token match: never "username").
+const NAME_FIELDS: &[&str] = &[
+    "input[autocomplete~=name i]:not([type=hidden])",
+    "input[name=name i]:not([type=hidden]), input[id=name i]:not([type=hidden]), \
+     input[name*=fullname i]:not([type=hidden]), input[name*=full_name i]:not([type=hidden])",
+];
+/// Words on a "go read your mail" page.
+const VERIFY_WORDS: &[&str] = &[
+    "check your email",
+    "verify your email",
+    "confirm your email",
 ];
 
 const CAPTCHA_DOM: &str = "[class*=captcha i], [id*=captcha i], [name*=captcha i], \
@@ -490,6 +519,129 @@ impl Session {
         let root = self.root()?;
         if self.query(&root, OTP_FIELD)?.is_some() {
             return Ok(PageState::Rejected);
+        }
+        self.page_state()
+    }
+
+    /// The `passwordrules` attribute of the signup form's new-password field, if any.
+    /// Page data, not a secret. Checks the page is on `site` first.
+    pub fn password_rules(&mut self, site: &str) -> Result<Option<String>, ExecError> {
+        self.fence(site, None)?;
+        let root = self.root()?;
+        let Some(pw) = self.signup_password_field(&root)? else {
+            return Ok(None);
+        };
+        let a = self.cdp.call("DOM.getAttributes", json!({"nodeId": pw}))?;
+        Ok(pure::attr(&a, "passwordrules").map(str::to_string))
+    }
+
+    fn signup_password_field(&mut self, scope: &Value) -> Result<Option<Value>, ExecError> {
+        match self.query(scope, NEW_PW)? {
+            Some(n) => Ok(Some(n)),
+            None => self.query(scope, "input[type=password i]"),
+        }
+    }
+
+    fn first_of(&mut self, scope: &Value, sels: &[&str]) -> Result<Option<Value>, ExecError> {
+        for sel in sels {
+            if let Some(n) = self.query(scope, sel)? {
+                return Ok(Some(n));
+            }
+        }
+        Ok(None)
+    }
+
+    /// Every match of `selector` under `node`.
+    fn query_all(&mut self, node: &Value, selector: &str) -> Result<Vec<Value>, ExecError> {
+        let r = self.cdp.call(
+            "DOM.querySelectorAll",
+            json!({"nodeId": node, "selector": selector}),
+        )?;
+        Ok(r["nodeIds"].as_array().cloned().unwrap_or_default())
+    }
+
+    /// Spend `token` for (Signup, `site`), fence the page and the form action like
+    /// [`Self::fill_login`], fill email, name (when asked and given) and every password
+    /// field (new + confirm), then submit and classify. Checkboxes are never ticked: an
+    /// unticked required one leaves the form filled but unsubmitted ([`PageState::NeedsConsent`]).
+    pub fn fill_signup(
+        &mut self,
+        site: &str,
+        email: &str,
+        name: &str,
+        password: &SecretString,
+        token: ApprovalToken,
+    ) -> Result<PageState, ExecError> {
+        token
+            .spend(Action::Signup, site)
+            .map_err(|_| ExecError::Token)?;
+        self.fence(site, None)?;
+        let root = self.root()?;
+        let pw_sel = if self.query(&root, NEW_PW)?.is_some() {
+            NEW_PW
+        } else {
+            "input[type=password i]"
+        };
+        let form = self.form_of(&root, pw_sel)?;
+        let scope = match &form {
+            Some(f) => f.clone(),
+            None => {
+                self.query(&root, pw_sel)?.ok_or(ExecError::Mapping)?;
+                root.clone()
+            }
+        };
+        self.fence(site, form.as_ref())?;
+        let pws = self.query_all(&scope, "input[type=password i]")?;
+        let first_pw = pws.first().cloned().ok_or(ExecError::Mapping)?;
+        let email_field = self
+            .first_of(&scope, EMAIL_FIELDS)?
+            .ok_or(ExecError::Mapping)?;
+        let name_field = self.first_of(&scope, NAME_FIELDS)?;
+
+        self.fill(&email_field, email, false)?;
+        if let Some(n) = name_field
+            && !name.is_empty()
+        {
+            self.fill(&n, name, false)?;
+        }
+        // New password and its confirmation: same value in each.
+        for p in &pws {
+            self.fill(p, password.expose(), true)?;
+        }
+        // Never tick a box. A required one left unticked stops here, unsubmitted.
+        for cb in self.query_all(&scope, "input[type=checkbox i][required]")? {
+            let a = self.cdp.call("DOM.getAttributes", json!({"nodeId": cb}))?;
+            if pure::attr(&a, "checked").is_none() {
+                return Ok(PageState::NeedsConsent);
+            }
+        }
+        self.press_enter(&first_pw)?;
+        self.settle(SUBMIT_LOAD)?;
+        self.signup_state()
+    }
+
+    /// Classify the page after a signup submit.
+    fn signup_state(&mut self) -> Result<PageState, ExecError> {
+        let url = self.current_url()?;
+        if url.is_empty() || url == "about:blank" || url.starts_with("chrome-error://") {
+            return Ok(PageState::Unknown);
+        }
+        let root = self.root()?;
+        if self.query(&root, OTP_FIELD)?.is_some() {
+            return Ok(PageState::NeedsOtp);
+        }
+        let tree = self.ax_tree()?;
+        if self.query(&root, CAPTCHA_DOM)?.is_some() || pure::ax_text(&tree).contains("captcha") {
+            return Ok(PageState::Captcha);
+        }
+        if self.query(&root, NEW_PW)?.is_some() {
+            return Ok(PageState::SignupForm);
+        }
+        let text = pure::ax_text(&tree);
+        if self.query(&root, "input[type=password i]")?.is_none()
+            && VERIFY_WORDS.iter().any(|w| text.contains(w))
+        {
+            return Ok(PageState::VerifyEmail);
         }
         self.page_state()
     }
