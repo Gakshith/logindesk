@@ -180,6 +180,7 @@ pub fn exec_status(e: ExecError) -> Status {
             failed(FailReason::FieldMappingFailed)
         }
         ExecError::Token => failed(FailReason::GrantDenied),
+        ExecError::Refused => failed(FailReason::FieldRefused),
         ExecError::NoChrome | ExecError::Protocol | ExecError::Browser(_) => {
             failed(FailReason::Internal)
         }

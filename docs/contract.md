@@ -189,3 +189,41 @@ terminal with `logindesk grant`), `ask` (Touch ID / Mac password each time,
 the default) or `deny`. A standing grant mints
 `ApprovalToken::from_standing_grant`; everything else goes through the
 `Approver`.
+
+## 12. Agent-driven forms: `open`, `type`, `fill_secret`
+
+For pages `login` / `signup` cannot map on their own (extra fields, odd
+layouts, passwordless sign-up), the agent drives the page step by step and
+the broker fills only the secrets. The agent never sees a secret value.
+
+**Executor (frozen, `crates/executor/src/lib.rs`):** `SecretField::{Password,
+Code, Email}`, `Session::{type_text, fill_at, press_enter_at}`,
+`ExecError::Refused` (→ `failed/field_refused`, `FailReason::FieldRefused`).
+- `type_text` refuses password and one-time-code fields: the agent cannot
+  type a secret, even one it guessed.
+- `fill_at(Password)` fills only `input[type=password]`; `Code` and `Email`
+  never fill a password field. Every call checks the page **and** the field's
+  form action are on the session's site (`Fence`).
+- Snapshot lines mark field kinds, e.g. `[12] textbox "Password" (password, empty)`,
+  `[14] textbox "Code" (code, empty)`, so the agent knows which ref takes which secret.
+
+**Socket ops (daemon):**
+- `open {url}` → a session on `url`'s registrable domain. No secret, no prompt.
+- `type {session_id, ref, text}` → `ok`. `text` ≤ 512 chars; the audit line
+  records the op and site, never the text.
+- `fill_secret {session_id, ref, secret, account?}` with `secret` one of:
+  - `password`: the session site's stored account (`account` picks one).
+    Gated like `login` (grant tier; `ask` = Touch ID naming the client); one
+    approval covers that session + account until it closes.
+  - `new_password`: generate a password (site rules), store it as a pending
+    record for the identity email, fill it. Gated like `signup` (blocklist,
+    daily limit, duplicate refusal). A second `new_password` in the same
+    session (the confirm box) reuses the same password.
+  - `email`: the identity's plus-address for this site (recorded as the
+    pending record's username).
+  - `code`: poll the connected mailbox for a code from the session's site
+    (`extract_otp`, `UsedCodes`), fill it. Gated by the site's login tier.
+- `press_enter {session_id, ref}` → submits the field's form.
+- A pending `new_password` record is confirmed when the session closes on a
+  page that is not a signup form; otherwise it stays pending (the password is
+  never lost).

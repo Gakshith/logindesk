@@ -379,7 +379,7 @@ impl Broker {
     fn fill_failed(&self, id: RecordId, e: ExecError) -> End {
         let before_submit = matches!(
             e,
-            ExecError::Fence | ExecError::Mapping(_) | ExecError::Token
+            ExecError::Fence | ExecError::Mapping(_) | ExecError::Token | ExecError::Refused
         );
         if before_submit {
             self.drop_record(id);

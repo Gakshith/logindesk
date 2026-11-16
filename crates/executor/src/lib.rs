@@ -41,6 +41,9 @@ pub enum ExecError {
     Mapping(MapFail),
     /// The approval token was expired or for another action/site.
     Token,
+    /// The field at this ref is not the kind the call allows (e.g. `type_text`
+    /// on a password field, or a password into a plain text box).
+    Refused,
     /// CDP returned an error.
     Protocol,
     /// Browser crashed / pipe closed / other internal error.
@@ -88,6 +91,17 @@ impl fmt::Display for ExecError {
 }
 
 impl std::error::Error for ExecError {}
+
+/// Which secret a field may receive, chosen by the broker and checked by the executor.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SecretField {
+    /// A stored or generated password: only `input[type=password]`.
+    Password,
+    /// An emailed one-time code: a code-like or plain text/number/tel input, never a password field.
+    Code,
+    /// The identity's (plus-addressed) email: an email or text input, never a password field.
+    Email,
+}
 
 /// How to launch the browser.
 #[derive(Debug, Clone)]
@@ -676,6 +690,37 @@ impl Session {
             return Ok(PageState::VerifyEmail);
         }
         self.page_state()
+    }
+
+    /// Type agent-supplied text into the field with this snapshot ref, replacing its
+    /// content; a `<select>` picks the option whose label or value matches. Checks the
+    /// page (and the field's form action) is on `site`. Refuses password fields,
+    /// one-time-code fields and anything that is not a text input, textarea, select
+    /// or contenteditable (`Refused`). Never presses Enter.
+    pub fn type_text(&mut self, site: &str, node_ref: u64, text: &str) -> Result<(), ExecError> {
+        let _ = (site, node_ref, text);
+        Err(ExecError::Browser("type_text: not built yet"))
+    }
+
+    /// Fill a secret into the field with this snapshot ref. The field must suit
+    /// `field` (see [`SecretField`]) or the call is `Refused`; the page and the
+    /// field's form action must be on `site` (`Fence`). Never presses Enter.
+    pub fn fill_at(
+        &mut self,
+        site: &str,
+        node_ref: u64,
+        field: SecretField,
+        value: &SecretString,
+    ) -> Result<(), ExecError> {
+        let _ = (site, node_ref, field, value);
+        Err(ExecError::Browser("fill_at: not built yet"))
+    }
+
+    /// Press Enter in the field with this snapshot ref (submits its form), then wait
+    /// for any navigation. Checks the page is on `site`.
+    pub fn press_enter_at(&mut self, site: &str, node_ref: u64) -> Result<(), ExecError> {
+        let _ = (site, node_ref);
+        Err(ExecError::Browser("press_enter_at: not built yet"))
     }
 
     /// Close the browser.

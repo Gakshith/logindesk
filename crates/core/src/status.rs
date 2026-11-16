@@ -85,6 +85,9 @@ pub enum FailReason {
     GrantDenied,
     /// Unknown or closed session.
     SessionNotFound,
+    /// The field is not the kind the call allows (text into a password box, a
+    /// password into a plain text box, ...).
+    FieldRefused,
     /// Something inside the broker broke (details in the audit log).
     Internal,
 }
@@ -136,7 +139,7 @@ impl NeedsUserReason {
 }
 
 impl FailReason {
-    const ALL: [Self; 12] = [
+    const ALL: [Self; 13] = [
         Self::CredentialsRejected,
         Self::NoAccount,
         Self::AccountAmbiguous,
@@ -148,6 +151,7 @@ impl FailReason {
         Self::NotPaired,
         Self::GrantDenied,
         Self::SessionNotFound,
+        Self::FieldRefused,
         Self::Internal,
     ];
     /// snake_case wire tag.
@@ -164,6 +168,7 @@ impl FailReason {
             Self::NotPaired => "not_paired",
             Self::GrantDenied => "grant_denied",
             Self::SessionNotFound => "session_not_found",
+            Self::FieldRefused => "field_refused",
             Self::Internal => "internal",
         }
     }
