@@ -12,10 +12,15 @@ mod prompt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
-use std::time::Instant;
+use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
+use logindesk_daemon::Config;
+use logindesk_daemon::mailcfg::{MailConfig, MailKind};
+use logindesk_daemon::server;
+use logindesk_policy::{Grants, Tier, site_of};
 use logindesk_vault::{Error, KdfParams, Keys, NewRecord, RecordId, RecordKind, Vault, hardening};
+use serde_json::json;
 
 use crate::prompt::Prompter;
 
@@ -53,11 +58,92 @@ enum Cmd {
     },
     /// Check the vault password and report how long an unlock takes.
     Unlock,
-    /// Lock the vault (until the daemon exists, nothing stays unlocked).
+    /// Tell the running daemon to drop its vault keys.
     Lock,
     /// Manage vault records.
     #[command(subcommand)]
     Vault(VaultCmd),
+    /// Run the broker: unlock once, then serve agents on a local socket until stopped.
+    Daemon {
+        /// Show the browser window (also `LOGINDESK_HEADFUL=1`).
+        #[arg(long)]
+        headful: bool,
+        /// Drop the vault keys after this many minutes with no request.
+        #[arg(long, value_name = "MIN")]
+        lock_after: Option<u64>,
+    },
+    /// Serve MCP on stdin/stdout (for an agent's MCP config). Needs a running daemon.
+    Mcp,
+    /// Per-site login grants: auto (no prompt), ask (Touch ID each time), deny.
+    #[command(subcommand)]
+    Grant(GrantCmd),
+    /// Where the daemon reads emailed one-time codes.
+    #[command(subcommand)]
+    Mail(MailCmd),
+    /// Log in to a site through the daemon (as client "cli") and print the reply.
+    Login {
+        /// Host or URL.
+        site: String,
+        /// Username or account id, when the site has more than one account.
+        #[arg(long)]
+        account: Option<String>,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum TierArg {
+    Auto,
+    Ask,
+    Deny,
+}
+
+impl From<TierArg> for Tier {
+    fn from(t: TierArg) -> Self {
+        match t {
+            TierArg::Auto => Self::Auto,
+            TierArg::Ask => Self::Ask,
+            TierArg::Deny => Self::Deny,
+        }
+    }
+}
+
+#[derive(Debug, Subcommand)]
+enum GrantCmd {
+    /// Set the login tier for a site.
+    Add {
+        /// Host or URL; stored as its registrable domain.
+        site: String,
+        /// auto: the agent logs in with no prompt. ask: Touch ID each time. deny: never.
+        #[arg(long, value_enum)]
+        tier: TierArg,
+    },
+    /// List grants.
+    List,
+    /// Remove a site's grant (it falls back to ask).
+    Remove {
+        /// Host or URL.
+        site: String,
+    },
+}
+
+#[derive(Debug, Clone, Copy, clap::ValueEnum)]
+enum MailKindArg {
+    Mailpit,
+    Outbox,
+}
+
+#[derive(Debug, Subcommand)]
+enum MailCmd {
+    /// Read codes from a local mailbox API.
+    Set {
+        /// mailpit or outbox.
+        #[arg(value_enum)]
+        kind: MailKindArg,
+        /// Base URL, e.g. http://127.0.0.1:8025
+        url: String,
+    },
+    /// Stop reading mail (sites that email a code return email_not_connected).
+    Off,
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,18 +243,139 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
                 mlock_note(&keys)
             );
             eprintln!(
-                "There is no daemon yet (Phase 4), so the vault locks again as this command exits."
+                "This command locks the vault again as it exits; `logindesk daemon` keeps it unlocked for agents."
             );
             Ok(())
         }
         Cmd::Lock => {
-            eprintln!(
-                "Nothing to lock: no daemon is running, so the vault is never left unlocked between commands."
-            );
-            Ok(())
+            let dir = data_dir(&path);
+            if !server::socket_path(&dir).exists() {
+                eprintln!(
+                    "Nothing to lock: no daemon is running, so the vault is never left unlocked between commands."
+                );
+                return Ok(());
+            }
+            let r = logindesk_mcp::client::call(&dir, "cli", json!({"op": "lock"}));
+            if r["status"] == "ok" {
+                eprintln!("The daemon dropped its vault keys. Restart it to unlock again.");
+                Ok(())
+            } else if r == logindesk_mcp::client::daemon_down() {
+                eprintln!(
+                    "Nothing to lock: no daemon is running, so the vault is never left unlocked between commands."
+                );
+                Ok(())
+            } else {
+                Err(format!("the daemon refused: {r}").into())
+            }
         }
         Cmd::Vault(cmd) => vault_cmd(&path, cmd, &mut prompt),
+        Cmd::Daemon {
+            headful,
+            lock_after,
+        } => {
+            let vault = Vault::open(&path)?;
+            let keys = unlock(&vault, &mut prompt)?;
+            let mut cfg = Config::for_vault(&path);
+            cfg.headless = !(headful || std::env::var("LOGINDESK_HEADFUL").is_ok_and(|v| v == "1"));
+            cfg.chrome = std::env::var_os("LOGINDESK_CHROME").map(PathBuf::from);
+            cfg.lock_after = lock_after.map(|m| Duration::from_secs(m.saturating_mul(60)));
+            Ok(logindesk_daemon::run(cfg, vault, keys)?)
+        }
+        Cmd::Mcp => Ok(logindesk_mcp::run(data_dir(&path))?),
+        Cmd::Grant(cmd) => grant_cmd(&path, cmd),
+        Cmd::Mail(cmd) => mail_cmd(&data_dir(&path), cmd),
+        Cmd::Login { site, account } => {
+            let mut op = json!({"op": "login", "site": site});
+            if let Some(a) = account {
+                op["account"] = a.into();
+            }
+            let r = logindesk_mcp::client::call(&data_dir(&path), "cli", op);
+            writeln!(std::io::stdout().lock(), "{r}")?;
+            if r["status"] == "logged_in" {
+                Ok(())
+            } else {
+                Err(format!("login did not complete ({})", r["status"]).into())
+            }
+        }
     }
+}
+
+/// Socket, token, audit, profiles and mail.json live beside the vault.
+fn data_dir(vault: &Path) -> PathBuf {
+    Config::for_vault(vault).data_dir
+}
+
+fn domain(site: &str) -> Result<String, Box<dyn std::error::Error>> {
+    site_of(site).ok_or_else(|| format!("{site:?} is not a website host or URL").into())
+}
+
+fn grant_cmd(vault: &Path, cmd: GrantCmd) -> Result<(), Box<dyn std::error::Error>> {
+    let gpath = Grants::path_beside(vault);
+    if let Some(dir) = gpath.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let mut g = Grants::load(&gpath)?;
+    match cmd {
+        GrantCmd::Add { site, tier } => {
+            let d = domain(&site)?;
+            let tier = Tier::from(tier);
+            g.login.insert(d.clone(), tier);
+            g.save(&gpath)?;
+            let what = match tier {
+                Tier::Auto => "agents may log in with no prompt",
+                Tier::Ask => "each login asks for Touch ID / your Mac password",
+                Tier::Deny => "logins are refused",
+            };
+            eprintln!("{d}: {what}.");
+        }
+        GrantCmd::List => {
+            let mut out = std::io::stdout().lock();
+            for (site, tier) in &g.login {
+                let t = match tier {
+                    Tier::Auto => "auto",
+                    Tier::Ask => "ask",
+                    Tier::Deny => "deny",
+                };
+                writeln!(out, "{site:<40}  {t}")?;
+            }
+            eprintln!(
+                "{} grant(s). Sites without one ask each time.",
+                g.login.len()
+            );
+        }
+        GrantCmd::Remove { site } => {
+            let d = domain(&site)?;
+            if g.login.remove(&d).is_none() {
+                return Err(format!("no grant for {d}").into());
+            }
+            g.save(&gpath)?;
+            eprintln!("{d}: grant removed; logins will ask each time.");
+        }
+    }
+    Ok(())
+}
+
+fn mail_cmd(dir: &Path, cmd: MailCmd) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    match cmd {
+        MailCmd::Set { kind, url } => {
+            let u = url::Url::parse(&url).map_err(|_| format!("{url:?} is not a URL"))?;
+            if u.scheme() != "http" && u.scheme() != "https" {
+                return Err("the mail URL must be http or https".into());
+            }
+            let kind = match kind {
+                MailKindArg::Mailpit => MailKind::Mailpit,
+                MailKindArg::Outbox => MailKind::Outbox,
+            };
+            MailConfig { kind, url }.save(dir)?;
+            eprintln!("Emailed codes will be read from {u}.");
+        }
+        MailCmd::Off => {
+            MailConfig::remove(dir)?;
+            eprintln!("Mail off: sites that email a code will return email_not_connected.");
+        }
+    }
+    Ok(())
 }
 
 fn mlock_note(keys: &Keys) -> &'static str {
