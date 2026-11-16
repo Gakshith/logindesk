@@ -26,7 +26,7 @@ pub fn daemon_down() -> Value {
 }
 
 fn exchange(data_dir: &Path, body: &[u8]) -> io::Result<Vec<u8>> {
-    let mut s = UnixStream::connect(data_dir.join("daemon.sock"))?;
+    let mut s = UnixStream::connect(logindesk_core::paths::socket_path(data_dir)?)?;
     s.set_read_timeout(Some(REPLY_WAIT))?;
     let n = u32::try_from(body.len()).map_err(|_| io::Error::other("request too large"))?;
     if body.len() > MAX_FRAME {

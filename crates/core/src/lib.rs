@@ -6,6 +6,7 @@
 
 pub mod ids;
 pub mod limits;
+pub mod paths;
 mod secret;
 pub mod status;
 

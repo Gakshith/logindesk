@@ -249,7 +249,7 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Lock => {
             let dir = data_dir(&path);
-            if !server::socket_path(&dir).exists() {
+            if !server::socket_path(&dir)?.exists() {
                 eprintln!(
                     "Nothing to lock: no daemon is running, so the vault is never left unlocked between commands."
                 );

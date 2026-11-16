@@ -6,7 +6,7 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use logindesk_mail::{MailSource, MailpitSource};
+use logindesk_mail::{MailSource, MailpitSource, OutboxSource};
 use serde::{Deserialize, Serialize};
 
 /// Mailbox kind.
@@ -76,12 +76,9 @@ impl MailConfig {
             MailKind::Mailpit => Some(Arc::new(MailpitSource {
                 base_url: self.url.clone(),
             })),
-            // LANE-MAIL adds `OutboxSource { base_url }`; it is not in the frozen
-            // stub this lane builds against. Wire it here after the merge.
-            MailKind::Outbox => {
-                eprintln!("logindesk: the outbox mail source is not in this build yet");
-                None
-            }
+            MailKind::Outbox => Some(Arc::new(OutboxSource {
+                base_url: self.url.clone(),
+            })),
         }
     }
 }

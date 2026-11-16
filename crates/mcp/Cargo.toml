@@ -10,6 +10,7 @@ publish.workspace = true
 
 # No dependency on vault, executor or mail: this crate cannot reach a secret.
 [dependencies]
+logindesk-core = { path = "../core" }
 rmcp = { workspace = true }
 schemars = { workspace = true }
 serde = { workspace = true }

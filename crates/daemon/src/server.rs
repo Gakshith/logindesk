@@ -36,8 +36,8 @@ const OPS: [&str; 8] = [
 const TICK: Duration = Duration::from_secs(15);
 
 /// Socket path for a data dir.
-pub fn socket_path(data_dir: &Path) -> PathBuf {
-    data_dir.join(SOCKET)
+pub fn socket_path(data_dir: &Path) -> io::Result<PathBuf> {
+    logindesk_core::paths::socket_path(data_dir)
 }
 
 /// Token path for a data dir.
@@ -76,7 +76,7 @@ impl Server {
     pub fn bind(data_dir: &Path) -> io::Result<Self> {
         std::fs::create_dir_all(data_dir)?;
         std::fs::set_permissions(data_dir, std::fs::Permissions::from_mode(0o700))?;
-        let socket = socket_path(data_dir);
+        let socket = socket_path(data_dir)?;
         if socket.exists() {
             if UnixStream::connect(&socket).is_ok() {
                 return Err(io::Error::new(
