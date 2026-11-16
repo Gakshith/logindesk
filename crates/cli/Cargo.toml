@@ -20,6 +20,7 @@ logindesk-daemon = { path = "../daemon" }
 logindesk-mcp = { path = "../mcp" }
 logindesk-approver = { path = "../approver" }
 logindesk-mail = { path = "../mail" }
+logindesk-executor = { path = "../executor" }
 serde_json = { workspace = true }
 url = { workspace = true }
 clap = { workspace = true }

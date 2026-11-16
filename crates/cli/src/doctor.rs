@@ -82,6 +82,7 @@ pub struct Opts {
 pub fn run(o: &Opts) -> Vec<Check> {
     let mut v = vec![
         chrome(),
+        browser_smoke(),
         vault(&o.vault),
         daemon(&o.data_dir),
         grants(&o.vault),
@@ -147,6 +148,103 @@ fn chrome() -> Check {
             "Chrome: not found",
             "install Google Chrome, or set LOGINDESK_CHROME=/path/to/chrome",
         ),
+    }
+}
+
+/// The test page: a login form built by JS after `load`, like a real SPA.
+const SMOKE_PAGE: &str = r#"<!doctype html><html lang="en"><head><meta charset="utf-8">
+<title>logindesk doctor</title></head><body><h1>logindesk doctor</h1><div id="app"></div>
+<script>setTimeout(function () { document.getElementById('app').innerHTML =
+'<form method="post" action="/never"><label for="u">Email</label> <input id="u" type="email" autocomplete="username">' +
+'<label for="p">Password</label> <input id="p" type="password" autocomplete="current-password">' +
+'<button type="submit">Sign in</button></form>'; }, 300);</script></body></html>"#;
+
+/// Serve [`SMOKE_PAGE`] on 127.0.0.1 until `stop` is set. Returns the port.
+fn serve_smoke_page(
+    stop: std::sync::Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<(u16, std::thread::JoinHandle<()>)> {
+    use std::io::Read;
+    use std::sync::atomic::Ordering;
+    let l = std::net::TcpListener::bind("127.0.0.1:0")?;
+    l.set_nonblocking(true)?;
+    let port = l.local_addr()?.port();
+    let h = std::thread::spawn(move || {
+        while !stop.load(Ordering::Relaxed) {
+            match l.accept() {
+                Ok((mut c, _)) => {
+                    let _ = c.set_nonblocking(false);
+                    let _ = c.set_read_timeout(Some(Duration::from_secs(2)));
+                    let mut buf = [0u8; 4096];
+                    let _ = c.read(&mut buf);
+                    let get_root = buf.starts_with(b"GET / ");
+                    let (status, body) = if get_root {
+                        ("200 OK", SMOKE_PAGE)
+                    } else {
+                        ("404 Not Found", "")
+                    };
+                    let _ = write!(
+                        c,
+                        "HTTP/1.1 {status}\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                }
+                Err(_) => std::thread::sleep(Duration::from_millis(20)),
+            }
+        }
+    });
+    Ok((port, h))
+}
+
+/// Launch the sealed browser headless on a throwaway profile, open a local test login
+/// page, and map + fill it with dummy values (never submitted, no secret).
+fn browser_smoke() -> Check {
+    use logindesk_executor::{BrowserConfig, ExecError, FormKind, Session};
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    const SITE: &str = "doctor.localhost";
+    if find_chrome().is_none() {
+        return skip(
+            "sealed browser: not tested (no Chrome)",
+            "install Google Chrome",
+        );
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    let (port, server) = match serve_smoke_page(stop.clone()) {
+        Ok(x) => x,
+        Err(e) => {
+            return fail(
+                format!("sealed browser: cannot serve the local test page ({e})"),
+                "check that 127.0.0.1 is reachable",
+            );
+        }
+    };
+    let profile = std::env::temp_dir().join(format!("logindesk-doctor-{}", std::process::id()));
+    let result = (|| {
+        let mut s = Session::launch(&BrowserConfig {
+            chrome: None,
+            profile_dir: profile.clone(),
+            headless: true,
+        })?;
+        s.navigate(&format!("http://{SITE}:{port}/"))?;
+        s.rehearse(SITE, FormKind::Login)
+    })();
+    stop.store(true, Ordering::Relaxed);
+    let _ = server.join();
+    let _ = std::fs::remove_dir_all(&profile);
+    let fix = "run `logindesk doctor` again; if it repeats, report the reason shown";
+    match result {
+        Ok(shape) if shape.passwords == 1 => {
+            ok("sealed browser: launches headless, maps and fills a test login form")
+        }
+        Ok(_) => fail(
+            "sealed browser: mapped the test form without its password field",
+            fix,
+        ),
+        Err(ExecError::Mapping(m)) => fail(
+            format!("sealed browser: could not map the test form ({})", m.wire()),
+            fix,
+        ),
+        Err(e) => fail(format!("sealed browser: {e}"), fix),
     }
 }
 

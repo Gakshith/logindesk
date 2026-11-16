@@ -1,6 +1,8 @@
 //! Append-only, hash-chained audit log (contract §9).
 //!
-//! One JSON object per line: `{ts, client, op, site, status, reason, prev, hash}`.
+//! One JSON object per line: `{ts, client, op, site, status, reason, [reason_detail,] prev, hash}`.
+//! `reason_detail` appears only when set (a fixed executor tag such as `no_email_field`
+//! on a `field_mapping_failed` line), so lines written before it existed still verify.
 //! `hash = sha256(prev || canonical)`, where `canonical` is the line's JSON
 //! without the `hash` field, with fields in exactly that order. The first
 //! line's `prev` is 64 zeros. Only typed values go in: never a secret, a URL
@@ -20,6 +22,25 @@ pub const GENESIS: &str = "00000000000000000000000000000000000000000000000000000
 
 /// Longest client name kept in the log.
 const CLIENT_MAX: usize = 64;
+
+thread_local! {
+    static MAP_FAIL: std::cell::Cell<Option<&'static str>> = const { std::cell::Cell::new(None) };
+}
+
+/// Remember the executor's mapping sub-reason for the next audit line this thread
+/// writes. Attached only if that line's reason is `field_mapping_failed`.
+pub fn note_map_fail(tag: &'static str) {
+    MAP_FAIL.with(|c| c.set(Some(tag)));
+}
+
+fn take_map_fail(reason: &str) -> &'static str {
+    let t = MAP_FAIL.with(std::cell::Cell::take);
+    if reason == "field_mapping_failed" {
+        t.unwrap_or("")
+    } else {
+        ""
+    }
+}
 
 /// One event, before chaining.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -45,6 +66,8 @@ struct Canonical<'a> {
     site: &'a str,
     status: &'a str,
     reason: &'a str,
+    #[serde(skip_serializing_if = "str::is_empty")]
+    reason_detail: &'a str,
     prev: &'a str,
 }
 
@@ -57,6 +80,8 @@ struct Line {
     site: String,
     status: String,
     reason: String,
+    #[serde(default)]
+    reason_detail: String,
     prev: String,
     hash: String,
 }
@@ -114,6 +139,7 @@ pub fn verify(path: &Path) -> Result<(usize, String), VerifyError> {
             site: &l.site,
             status: &l.status,
             reason: &l.reason,
+            reason_detail: &l.reason_detail,
             prev: &l.prev,
         };
         let bytes = serde_json::to_vec(&c).map_err(|_| VerifyError::Broken(i + 1))?;
@@ -184,6 +210,7 @@ impl Audit {
             site: ev.site,
             status: ev.status,
             reason: ev.reason,
+            reason_detail: take_map_fail(ev.reason),
             prev: &self.prev,
         };
         let mut bytes = serde_json::to_vec(&c).map_err(io::Error::other)?;
@@ -231,6 +258,37 @@ mod tests {
     }
 
     #[test]
+    fn mapping_detail_is_recorded_only_on_its_line() {
+        let p = tmp("detail");
+        {
+            let mut a = Audit::open(&p).unwrap();
+            // A line written before reason_detail existed (empty detail: no field).
+            a.record(&ev("example.com", "logged_in")).unwrap();
+            note_map_fail("no_email_field");
+            a.record(&Event {
+                reason: "field_mapping_failed",
+                ..ev("example.com", "failed")
+            })
+            .unwrap();
+            // A stale note never lands on an unrelated line.
+            note_map_fail("no_form");
+            a.record(&Event {
+                reason: "fence_blocked",
+                ..ev("example.com", "failed")
+            })
+            .unwrap();
+        }
+        let text = std::fs::read_to_string(&p).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert!(!lines[0].contains("reason_detail"));
+        assert!(lines[1].contains(
+            r#""reason":"field_mapping_failed","reason_detail":"no_email_field","prev""#
+        ));
+        assert!(!lines[2].contains("reason_detail"));
+        assert_eq!(verify(&p).unwrap().0, 3);
+    }
+
+    #[test]
     fn chain_verifies_and_edits_break_it() {
         let p = tmp("chain");
         {
@@ -272,6 +330,7 @@ mod tests {
             site: "evil.org",
             status: &l.status,
             reason: &l.reason,
+            reason_detail: &l.reason_detail,
             prev: &l.prev,
         };
         let mut forged = serde_json::to_vec(&c).unwrap();

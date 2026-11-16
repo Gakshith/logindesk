@@ -183,6 +183,67 @@ pub(crate) fn quad_centre(model: &Value) -> Option<(f64, f64)> {
     ))
 }
 
+/// A `DOM.getBoxModel` reply for something a user could see: a real size, and not
+/// pushed off-screen to the left or top (a common honeypot trick).
+pub(crate) fn box_visible(model: &Value) -> bool {
+    let m = &model["model"];
+    let (w, h) = (
+        m["width"].as_f64().unwrap_or(0.0),
+        m["height"].as_f64().unwrap_or(0.0),
+    );
+    if w < 1.0 || h < 1.0 {
+        return false;
+    }
+    let Some(q) = m["border"].as_array().or_else(|| m["content"].as_array()) else {
+        return false;
+    };
+    let v: Vec<f64> = q.iter().filter_map(Value::as_f64).collect();
+    if v.len() != 8 {
+        return false;
+    }
+    let max_x = v[0].max(v[2]).max(v[4]).max(v[6]);
+    let max_y = v[1].max(v[3]).max(v[5]).max(v[7]);
+    max_x > 0.0 && max_y > 0.0
+}
+
+/// Buttons and links whose accessible name is an opener word, best group first, in
+/// page order within a group. Long names (sentences) and "... with Google"-style
+/// third-party sign-ins are skipped.
+pub(crate) fn opener_candidates(tree: &Value, groups: &[&[&str]], max_len: usize) -> Vec<u64> {
+    let Some(nodes) = tree["nodes"].as_array() else {
+        return Vec::new();
+    };
+    let mut out = Vec::new();
+    for words in groups {
+        for n in nodes {
+            if n["ignored"].as_bool() == Some(true) || !matches!(role(n), "button" | "link") {
+                continue;
+            }
+            let nm = name(n).trim().to_lowercase();
+            if nm.is_empty() || nm.chars().count() > max_len || nm.contains(" with ") {
+                continue;
+            }
+            if words.iter().any(|w| nm.contains(w))
+                && let Some(id) = n["backendDOMNodeId"].as_u64()
+                && !out.contains(&id)
+            {
+                out.push(id);
+            }
+        }
+    }
+    out
+}
+
+/// Clicking a link with this `href` keeps us on `site`: an in-page link (`#...`,
+/// `javascript:`), or a URL whose registrable domain is `site`.
+pub(crate) fn href_stays_on_site(page: &Url, href: &str, site: &str) -> bool {
+    let h = href.trim();
+    if h.is_empty() || h.starts_with('#') || h.to_ascii_lowercase().starts_with("javascript:") {
+        return true;
+    }
+    action_on_site(page, Some(h), site)
+}
+
 #[cfg(test)]
 mod tests {
     #![allow(clippy::unwrap_used)]
@@ -281,6 +342,58 @@ mod tests {
         assert!(!action_on_site(&look, Some("/collect"), site));
         let ip = Url::parse("http://127.0.0.1:4000/login").unwrap();
         assert!(!on_site(&ip, site));
+    }
+
+    #[test]
+    fn visibility() {
+        let on = json!({"model": {"width": 120, "height": 20,
+            "border": [10.0, 10.0, 130.0, 10.0, 130.0, 30.0, 10.0, 30.0]}});
+        assert!(box_visible(&on));
+        let off = json!({"model": {"width": 120, "height": 20,
+            "border": [-9999.0, 0.0, -9879.0, 0.0, -9879.0, 20.0, -9999.0, 20.0]}});
+        assert!(!box_visible(&off));
+        let zero = json!({"model": {"width": 0, "height": 0,
+            "border": [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0]}});
+        assert!(!box_visible(&zero));
+        assert!(!box_visible(&json!({})));
+    }
+
+    #[test]
+    fn openers() {
+        let t = json!({"nodes": [
+            {"nodeId": "1", "role": {"value": "link"}, "name": {"value": "Sign in with Google"}, "backendDOMNodeId": 1},
+            {"nodeId": "2", "role": {"value": "link"}, "name": {"value": "Log in"}, "backendDOMNodeId": 2},
+            {"nodeId": "3", "role": {"value": "button"}, "name": {"value": "Create account"}, "backendDOMNodeId": 3},
+            {"nodeId": "4", "role": {"value": "button"}, "name": {"value": "Already have an account? Log in to keep going today"}, "backendDOMNodeId": 4},
+            {"nodeId": "5", "ignored": true, "role": {"value": "button"}, "name": {"value": "Sign up"}, "backendDOMNodeId": 5},
+            {"nodeId": "6", "role": {"value": "StaticText"}, "name": {"value": "Sign up"}, "backendDOMNodeId": 6}
+        ]});
+        let signup: &[&[&str]] = &[&["sign up", "create account"], &["sign in", "log in"]];
+        assert_eq!(opener_candidates(&t, signup, 40), vec![3, 2]);
+        let login: &[&[&str]] = &[&["sign in", "log in"]];
+        assert_eq!(opener_candidates(&t, login, 40), vec![2]);
+    }
+
+    #[test]
+    fn opener_links_stay_on_site() {
+        let page = Url::parse("https://app.example.com/").unwrap();
+        assert!(href_stays_on_site(&page, "#login", "example.com"));
+        assert!(href_stays_on_site(
+            &page,
+            "javascript:void(0)",
+            "example.com"
+        ));
+        assert!(href_stays_on_site(&page, "/signin", "example.com"));
+        assert!(href_stays_on_site(
+            &page,
+            "https://auth.example.com/x",
+            "example.com"
+        ));
+        assert!(!href_stays_on_site(
+            &page,
+            "https://accounts.google.com/o",
+            "example.com"
+        ));
     }
 
     #[test]
