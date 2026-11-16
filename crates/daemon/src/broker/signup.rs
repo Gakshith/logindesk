@@ -377,7 +377,10 @@ impl Broker {
     /// A fill error: before submit (fence, mapping, token) nothing reached the
     /// site and the record goes; otherwise it stays pending.
     fn fill_failed(&self, id: RecordId, e: ExecError) -> End {
-        let before_submit = matches!(e, ExecError::Fence | ExecError::Mapping | ExecError::Token);
+        let before_submit = matches!(
+            e,
+            ExecError::Fence | ExecError::Mapping(_) | ExecError::Token
+        );
         if before_submit {
             self.drop_record(id);
             End::fail(exec_status(e))

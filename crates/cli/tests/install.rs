@@ -275,6 +275,12 @@ fn doctor_with_missing_vault_reports_and_does_not_panic() {
     assert!(err.contains("✗ daemon: not running"), "{err}");
     assert!(err.contains("– approval popup: not tested"), "{err}");
     assert!(err.contains("stdout:"), "{err}");
+    // With Chrome installed, the sealed browser maps the local test page.
+    assert!(
+        err.contains("✓ sealed browser: launches headless, maps and fills a test login form")
+            || err.contains("– sealed browser: not tested (no Chrome)"),
+        "{err}"
+    );
     assert!(o.stdout.is_empty(), "doctor wrote to stdout");
 }
 

@@ -10,7 +10,7 @@ use axum::routing::get;
 use logindesk_approver::{Action, ApprovalRequest, ApprovalToken};
 use logindesk_core::SecretString;
 use logindesk_core::ids::RequestId;
-use logindesk_executor::{BrowserConfig, ExecError, PageState, Session};
+use logindesk_executor::{BrowserConfig, ExecError, FormKind, MapFail, PageState, Session};
 use testbed::fixtures::Fixtures;
 use testbed::site::{self, MailSink, Running};
 
@@ -207,7 +207,7 @@ fn iframe_only_login_is_a_mapping_failure() {
     let (user, pw) = (e.fx.user_email.clone(), e.fx.user_password.clone());
     let r =
         e.s.fill_login(SITE, &user, &SecretString::new(pw), token(SITE));
-    assert_eq!(r, Err(ExecError::Mapping));
+    assert_eq!(r, Err(ExecError::Mapping(MapFail::NoForm)));
 }
 
 #[test]
@@ -299,4 +299,131 @@ fn click_follows_a_link() {
     e.s.click(r).expect("click");
     assert!(e.s.current_url().expect("url").ends_with("/login"));
     assert_eq!(e.s.page_state(), Ok(PageState::LoginForm));
+}
+
+// ---------- real-site shapes (fix round: every real page was field_mapping_failed) ----------
+
+fn signup_token(site: &str) -> ApprovalToken {
+    ApprovalToken::from_standing_grant(&ApprovalRequest {
+        request_id: RequestId::random(),
+        client_name: "executor-test".into(),
+        action: Action::Signup,
+        site: site.into(),
+        shares: vec![],
+    })
+}
+
+fn login_at(e: &mut Env, path: &str, user: &str, pw: &str) -> Result<PageState, ExecError> {
+    let url = format!("{}{path}", e.base());
+    e.s.navigate(&url).expect("navigate");
+    e.s.fill_login(SITE, user, &SecretString::new(pw.to_string()), token(SITE))
+}
+
+/// The form is built by JS 2 s after `load` (what broke on real SPA pages).
+#[test]
+fn form_rendered_after_load_is_waited_for() {
+    let Some(mut e) = env() else { return };
+    let (user, pw) = (e.fx.user_email.clone(), e.fx.user_password.clone());
+    assert_eq!(
+        login_at(&mut e, "/login-late", &user, &pw),
+        Ok(PageState::LoggedIn)
+    );
+}
+
+/// No form until "Sign in" is clicked; the off-site "Sign in with Google" is skipped.
+#[test]
+fn sign_in_button_opens_the_form() {
+    let Some(mut e) = env() else { return };
+    let (user, pw) = (e.fx.user_email.clone(), e.fx.user_password.clone());
+    assert_eq!(
+        login_at(&mut e, "/login-js", &user, &pw),
+        Ok(PageState::LoggedIn)
+    );
+    assert!(e.s.current_url().expect("url").ends_with("/account"));
+}
+
+#[test]
+fn two_step_login() {
+    let Some(mut e) = env() else { return };
+    let (user, pw) = (e.fx.user_email.clone(), e.fx.user_password.clone());
+    assert_eq!(
+        login_at(&mut e, "/login-two-step", &user, &pw),
+        Ok(PageState::LoggedIn)
+    );
+}
+
+#[test]
+fn two_step_unknown_account_is_rejected() {
+    let Some(mut e) = env() else { return };
+    let pw = e.fx.user_password.clone();
+    assert_eq!(
+        login_at(&mut e, "/login-two-step", "nobody@example.localhost", &pw),
+        Ok(PageState::Rejected)
+    );
+}
+
+/// The password page of a two-step login posts to another origin: fenced, nothing sent.
+#[test]
+fn two_step_password_page_is_fenced() {
+    let Some(mut e) = env() else { return };
+    let (user, pw) = (e.fx.user_email.clone(), e.fx.user_password.clone());
+    assert_eq!(
+        login_at(&mut e, "/login-two-step?evil=1", &user, &pw),
+        Err(ExecError::Fence)
+    );
+    assert!(e.run.site.collected().is_empty(), "the password was posted");
+}
+
+/// Late-rendered signup with new + confirm password and an off-screen honeypot:
+/// rehearse maps it, fills the two visible passwords, leaves the honeypot empty.
+#[test]
+fn signup_rehearsal_skips_the_honeypot() {
+    let Some(mut e) = env() else { return };
+    let url = format!("{}/signup-late", e.base());
+    e.s.navigate(&url).expect("navigate");
+    let shape = e.s.rehearse(SITE, FormKind::Signup).expect("rehearse");
+    assert_eq!(shape.passwords, 2);
+    assert!(!shape.two_step);
+    let snap = e.s.snapshot().expect("snapshot");
+    let all = snap.lines.join("\n");
+    eprintln!("signup rehearsal snapshot:\n{all}");
+    assert!(all.contains("textbox \"Email\" (filled)"), "{all}");
+    assert!(all.contains("\"Password\" (filled)"), "{all}");
+    assert!(all.contains("\"Confirm password\" (filled)"), "{all}");
+    assert!(all.contains("\"Leave this empty\" (empty)"), "{all}");
+    assert!(!all.contains("rehearsal"), "a value leaked: {all}");
+    assert!(
+        e.s.current_url().expect("url").ends_with("/signup-late"),
+        "submitted"
+    );
+}
+
+#[test]
+fn late_signup_form_signs_up() {
+    let Some(mut e) = env() else { return };
+    let url = format!("{}/signup-late", e.base());
+    e.s.navigate(&url).expect("navigate");
+    let r = e.s.fill_signup(
+        SITE,
+        "new-user@example.localhost",
+        "New User",
+        &SecretString::new("Fresh-password-123".into()),
+        signup_token(SITE),
+    );
+    assert!(
+        matches!(r, Ok(PageState::NeedsOtp | PageState::VerifyEmail)),
+        "{r:?}"
+    );
+}
+
+#[test]
+fn page_without_a_form_says_why() {
+    let Some(mut e) = env() else { return };
+    // A page with no form and no "Sign in" button at all.
+    let url = format!("{}/_testbed/outbox", e.base());
+    e.s.navigate(&url).expect("navigate");
+    let (user, pw) = (e.fx.user_email.clone(), e.fx.user_password.clone());
+    let r =
+        e.s.fill_login(SITE, &user, &SecretString::new(pw), token(SITE));
+    assert_eq!(r, Err(ExecError::Mapping(MapFail::NoForm)));
 }

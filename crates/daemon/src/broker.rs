@@ -172,7 +172,13 @@ pub fn exec_status(e: ExecError) -> Status {
         ExecError::Fence => failed(FailReason::FenceBlocked),
         ExecError::Unreachable => failed(FailReason::SiteUnreachable),
         ExecError::Timeout => failed(FailReason::Timeout),
-        ExecError::Mapping => failed(FailReason::FieldMappingFailed),
+        ExecError::Mapping(m) => {
+            // The agent sees only field_mapping_failed; the sub-reason (a fixed tag,
+            // never a field value) goes to stderr and the audit line.
+            eprintln!("logindesk: field mapping failed: {}", m.wire());
+            crate::audit::note_map_fail(m.wire());
+            failed(FailReason::FieldMappingFailed)
+        }
         ExecError::Token => failed(FailReason::GrantDenied),
         ExecError::NoChrome | ExecError::Protocol | ExecError::Browser(_) => {
             failed(FailReason::Internal)
@@ -785,7 +791,10 @@ mod tests {
         assert_eq!(r(ExecError::Fence), FailReason::FenceBlocked);
         assert_eq!(r(ExecError::Unreachable), FailReason::SiteUnreachable);
         assert_eq!(r(ExecError::Timeout), FailReason::Timeout);
-        assert_eq!(r(ExecError::Mapping), FailReason::FieldMappingFailed);
+        assert_eq!(
+            r(ExecError::Mapping(logindesk_executor::MapFail::NoForm)),
+            FailReason::FieldMappingFailed
+        );
         assert_eq!(r(ExecError::Token), FailReason::GrantDenied);
         assert_eq!(r(ExecError::NoChrome), FailReason::Internal);
     }

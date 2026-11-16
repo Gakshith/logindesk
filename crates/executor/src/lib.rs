@@ -8,6 +8,7 @@
 //! FROZEN API (docs/contract.md §10).
 
 mod cdp;
+mod map;
 mod pure;
 #[allow(unsafe_code)]
 mod spawn;
@@ -23,6 +24,8 @@ use logindesk_core::limits::{PAGE_LOAD_MAX, SNAPSHOT_MAX};
 use serde_json::{Value, json};
 use url::Url;
 
+pub use map::{FormKind, FormShape};
+
 /// Why an executor call failed. Never carries page text or a secret.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ExecError {
@@ -34,14 +37,48 @@ pub enum ExecError {
     Timeout,
     /// The page, form action or field is not on the token's site.
     Fence,
-    /// No login / code field could be found.
-    Mapping,
+    /// No login / signup / code field could be found; the reason says which.
+    Mapping(MapFail),
     /// The approval token was expired or for another action/site.
     Token,
     /// CDP returned an error.
     Protocol,
     /// Browser crashed / pipe closed / other internal error.
     Browser(&'static str),
+}
+
+/// Why the fields could not be mapped. A fixed tag: never a field value or page text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum MapFail {
+    /// A signup form with no visible email field.
+    NoEmailField,
+    /// A password field with no visible username field next to it.
+    NoUsernameField,
+    /// After the username step, no password field appeared.
+    NoPasswordField,
+    /// No login or signup form on the page, even after opener clicks.
+    NoForm,
+    /// The element to click has no box (not rendered).
+    NoBoxModel,
+    /// The fields exist but are hidden or off-screen.
+    NotVisible,
+    /// No visible one-time-code field.
+    NoCodeField,
+}
+
+impl MapFail {
+    /// snake_case tag for logs and the audit line.
+    pub fn wire(self) -> &'static str {
+        match self {
+            Self::NoEmailField => "no_email_field",
+            Self::NoUsernameField => "no_username_field",
+            Self::NoPasswordField => "no_password_field",
+            Self::NoForm => "no_form",
+            Self::NoBoxModel => "no_box_model",
+            Self::NotVisible => "not_visible",
+            Self::NoCodeField => "no_code_field",
+        }
+    }
 }
 
 impl fmt::Display for ExecError {
@@ -118,19 +155,6 @@ const OTP_FIELD: &str = "input[autocomplete~=one-time-code i], input[name*=otp i
 input[id*=otp i], input[name=code i], input[id=code i], input[name*=one-time i], \
 input[name*=onetime i], input[name*=verification i]";
 
-/// Username field inside the login form, in order of preference.
-const USER_FIELDS: &[&str] = &[
-    "input[autocomplete~=username i]:not([type=hidden])",
-    "input[type=email i]",
-    "input[name*=user i]:not([type=hidden]):not([type=password]), \
-     input[id*=user i]:not([type=hidden]):not([type=password]), \
-     input[name*=email i]:not([type=hidden]):not([type=password]), \
-     input[id*=email i]:not([type=hidden]):not([type=password]), \
-     input[name*=login i]:not([type=hidden]):not([type=password]), \
-     input[id*=login i]:not([type=hidden]):not([type=password])",
-    "input[type=text i], input:not([type])",
-];
-
 /// The new-password field of a signup form, most specific first.
 const NEW_PW: &str = "input[autocomplete~=new-password i]";
 /// Email field of a signup form.
@@ -160,6 +184,18 @@ const CAPTCHA_DOM: &str = "[class*=captcha i], [id*=captcha i], [name*=captcha i
 const NAV_START: Duration = Duration::from_secs(3);
 /// fill_login / fill_otp: total wait for the post-submit load.
 const SUBMIT_LOAD: Duration = Duration::from_secs(10);
+
+/// The current user's login name, from `id -un`.
+fn login_name() -> Option<String> {
+    let out = Command::new("/usr/bin/id")
+        .arg("-un")
+        .stdin(Stdio::null())
+        .stderr(Stdio::null())
+        .output()
+        .ok()?;
+    let name = String::from_utf8(out.stdout).ok()?.trim().to_string();
+    (out.status.success() && !name.is_empty()).then_some(name)
+}
 
 fn find_chrome(cfg: &BrowserConfig) -> Option<PathBuf> {
     if let Some(p) = &cfg.chrome {
@@ -200,6 +236,13 @@ impl Session {
             ]);
         if cfg.headless {
             cmd.arg("--headless=new");
+        }
+        // Chrome on macOS stalls at startup when USER is missing (a bare launchd or
+        // `env -i` environment). Give the child the login name in that case.
+        if std::env::var_os("USER").is_none_or(|u| u.is_empty())
+            && let Some(name) = login_name()
+        {
+            cmd.env("USER", &name).env("LOGNAME", &name);
         }
         cmd.arg("about:blank")
             .stdin(Stdio::null())
@@ -309,8 +352,11 @@ impl Session {
         let node = json!({"backendNodeId": node_ref});
         // Best effort: an element already on screen needs no scroll.
         let _ = self.cdp.call("DOM.scrollIntoViewIfNeeded", node.clone());
-        let model = self.cdp.call("DOM.getBoxModel", node)?;
-        let (x, y) = pure::quad_centre(&model).ok_or(ExecError::Mapping)?;
+        let model = self
+            .cdp
+            .call("DOM.getBoxModel", node)
+            .map_err(|_| ExecError::Mapping(MapFail::NoBoxModel))?;
+        let (x, y) = pure::quad_centre(&model).ok_or(ExecError::Mapping(MapFail::NoBoxModel))?;
         self.cdp.clear_events();
         for kind in ["mousePressed", "mouseReleased"] {
             self.cdp.call(
@@ -424,11 +470,6 @@ impl Session {
         Ok(())
     }
 
-    /// The `<form>` that holds `field`, if any.
-    fn form_of(&mut self, root: &Value, selector: &str) -> Result<Option<Value>, ExecError> {
-        self.query(root, &format!("form:has({selector})"))
-    }
-
     /// Focus `node`, select whatever is in it, and type `text` over it.
     fn fill(&mut self, node: &Value, text: &str, secret: bool) -> Result<(), ExecError> {
         self.cdp.call("DOM.focus", json!({"nodeId": node}))?;
@@ -474,46 +515,57 @@ impl Session {
         token
             .spend(Action::Login, site)
             .map_err(|_| ExecError::Token)?;
-        // The page itself first: a lookalike fails here before anything is read from it.
-        self.fence(site, None)?;
-        let root = self.root()?;
+        // Page fence first: a lookalike fails before anything is read from it. Then
+        // wait for the (possibly JS-built) form, opening a "Sign in" panel if needed.
         // A password field only inside an iframe is not in this document: Mapping.
-        let form = self.form_of(&root, "input[type=password i]")?;
-        let scope = match &form {
-            Some(f) => f.clone(),
-            None => {
-                self.query(&root, "input[type=password i]")?
-                    .ok_or(ExecError::Mapping)?;
-                root.clone()
+        let mut clicks = 0;
+        // Map and fill (no submit), again if the page re-renders under us.
+        let m = self.retry_on_stale(|s| {
+            let m = s.map_login(site, &mut clicks)?;
+            let user = m
+                .user
+                .as_ref()
+                .ok_or(ExecError::Mapping(MapFail::NoUsernameField))?;
+            s.fill(user, username, false)?;
+            if let Some(pw) = &m.password {
+                s.fill(pw, password.expose(), true)?;
             }
+            Ok(m)
+        })?;
+        let (Some(user), None) = (&m.user, &m.password) else {
+            let pw = m
+                .password
+                .as_ref()
+                .ok_or(ExecError::Mapping(MapFail::NoPasswordField))?;
+            self.press_enter(pw)?;
+            self.settle(SUBMIT_LOAD)?;
+            return self.page_state();
         };
-        self.fence(site, form.as_ref())?;
-        let pw = self
-            .query(&scope, "input[type=password i]")?
-            .ok_or(ExecError::Mapping)?;
-        let mut user = None;
-        for sel in USER_FIELDS {
-            if let Some(n) = self.query(&scope, sel)? {
-                user = Some(n);
-                break;
-            }
-        }
-        let user = user.ok_or(ExecError::Mapping)?;
-        self.fill(&user, username, false)?;
-        self.fill(&pw, password.expose(), true)?;
-        self.press_enter(&pw)?;
+        // Two-step: username submitted, then the password on the next page (fenced
+        // again there).
+        self.press_enter(user)?;
         self.settle(SUBMIT_LOAD)?;
+        let step = self.retry_on_stale(|s| {
+            let step = s.map_password_step(site)?;
+            if let map::StepTwo::Password { field, .. } = &step {
+                s.fill(field, password.expose(), true)?;
+            }
+            Ok(step)
+        })?;
+        if let map::StepTwo::Password { field, .. } = &step {
+            self.press_enter(field)?;
+            self.settle(SUBMIT_LOAD)?;
+        }
         self.page_state()
     }
 
     /// Check the page is on `site`, fill the one-time code, submit, wait, classify.
     pub fn fill_otp(&mut self, site: &str, code: &SecretString) -> Result<PageState, ExecError> {
-        self.fence(site, None)?;
-        let root = self.root()?;
-        let field = self.query(&root, OTP_FIELD)?.ok_or(ExecError::Mapping)?;
-        let form = self.form_of(&root, OTP_FIELD)?;
-        self.fence(site, form.as_ref())?;
-        self.fill(&field, code.expose(), true)?;
+        let field = self.retry_on_stale(|s| {
+            let (_form, field) = s.map_code(site)?;
+            s.fill(&field, code.expose(), true)?;
+            Ok(field)
+        })?;
         self.press_enter(&field)?;
         self.settle(SUBMIT_LOAD)?;
         let root = self.root()?;
@@ -542,15 +594,6 @@ impl Session {
         }
     }
 
-    fn first_of(&mut self, scope: &Value, sels: &[&str]) -> Result<Option<Value>, ExecError> {
-        for sel in sels {
-            if let Some(n) = self.query(scope, sel)? {
-                return Ok(Some(n));
-            }
-        }
-        Ok(None)
-    }
-
     /// Every match of `selector` under `node`.
     fn query_all(&mut self, node: &Value, selector: &str) -> Result<Vec<Value>, ExecError> {
         let r = self.cdp.call(
@@ -575,39 +618,28 @@ impl Session {
         token
             .spend(Action::Signup, site)
             .map_err(|_| ExecError::Token)?;
-        self.fence(site, None)?;
-        let root = self.root()?;
-        let pw_sel = if self.query(&root, NEW_PW)?.is_some() {
-            NEW_PW
-        } else {
-            "input[type=password i]"
-        };
-        let form = self.form_of(&root, pw_sel)?;
-        let scope = match &form {
-            Some(f) => f.clone(),
-            None => {
-                self.query(&root, pw_sel)?.ok_or(ExecError::Mapping)?;
-                root.clone()
+        let mut clicks = 0;
+        let m = self.retry_on_stale(|s| {
+            let m = s.map_signup(site, &mut clicks)?;
+            s.fill(&m.email, email, false)?;
+            if let Some(n) = &m.name
+                && !name.is_empty()
+            {
+                s.fill(n, name, false)?;
             }
-        };
-        self.fence(site, form.as_ref())?;
-        let pws = self.query_all(&scope, "input[type=password i]")?;
-        let first_pw = pws.first().cloned().ok_or(ExecError::Mapping)?;
-        let email_field = self
-            .first_of(&scope, EMAIL_FIELDS)?
-            .ok_or(ExecError::Mapping)?;
-        let name_field = self.first_of(&scope, NAME_FIELDS)?;
-
-        self.fill(&email_field, email, false)?;
-        if let Some(n) = name_field
-            && !name.is_empty()
-        {
-            self.fill(&n, name, false)?;
-        }
-        // New password and its confirmation: same value in each.
-        for p in &pws {
-            self.fill(p, password.expose(), true)?;
-        }
+            // New password and its confirmation: same value in each (visible ones
+            // only: an off-screen honeypot stays empty).
+            for p in &m.passwords {
+                s.fill(p, password.expose(), true)?;
+            }
+            Ok(m)
+        })?;
+        let first_pw = m
+            .passwords
+            .first()
+            .cloned()
+            .ok_or(ExecError::Mapping(MapFail::NoPasswordField))?;
+        let scope = m.form.clone().unwrap_or_else(|| m.root.clone());
         // Never tick a box. A required one left unticked stops here, unsubmitted.
         for cb in self.query_all(&scope, "input[type=checkbox i][required]")? {
             let a = self.cdp.call("DOM.getAttributes", json!({"nodeId": cb}))?;

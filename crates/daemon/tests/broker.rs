@@ -91,7 +91,7 @@ impl Browser for FakeBrowser {
             self.url = format!("{}#settings", self.url);
             Ok(())
         } else {
-            Err(ExecError::Mapping)
+            Err(ExecError::Mapping(logindesk_executor::MapFail::NoForm))
         }
     }
     fn page_state(&mut self) -> Result<PageState, ExecError> {
@@ -563,7 +563,7 @@ fn page_states_map_to_statuses() {
             false,
         ),
         (
-            Err(ExecError::Mapping),
+            Err(ExecError::Mapping(logindesk_executor::MapFail::NoForm)),
             "failed/field_mapping_failed",
             false,
         ),
@@ -1029,7 +1029,7 @@ fn signup_statuses_and_what_happens_to_the_pending_record() {
             false,
         ),
         (
-            vec![Err(ExecError::Mapping)],
+            vec![Err(ExecError::Mapping(logindesk_executor::MapFail::NoForm))],
             MailMode::None,
             "failed/field_mapping_failed",
             false,

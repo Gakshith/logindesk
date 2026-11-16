@@ -22,6 +22,8 @@ use serde::Serialize;
 
 use crate::fixtures::{Fixtures, SITE_DOMAIN, random_alnum};
 
+mod spa;
+
 /// The lookalike host. `*.localhost` resolves to loopback in Chrome, so no DNS setup is needed.
 pub const LOOKALIKE_HOST: &str = "examp1e.localhost";
 /// The real host name of the fake site.
@@ -209,7 +211,7 @@ pub fn now() -> u64 {
 
 /// The main listener's routes (pages, Gmail mock, test hooks).
 pub fn router(site: Shared) -> Router {
-    Router::new()
+    spa::routes(Router::new())
         .route("/", get(index))
         .route("/login", get(login_page).post(login_submit))
         .route("/login/otp", get(otp_page).post(otp_submit))

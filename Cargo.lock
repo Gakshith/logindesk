@@ -1044,6 +1044,7 @@ dependencies = [
  "logindesk-approver",
  "logindesk-core",
  "logindesk-daemon",
+ "logindesk-executor",
  "logindesk-mail",
  "logindesk-mcp",
  "logindesk-policy",
