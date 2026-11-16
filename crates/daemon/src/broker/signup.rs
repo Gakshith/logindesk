@@ -27,9 +27,9 @@ pub(super) const SIGNUPS_PER_DAY: usize = 10;
 /// `notes` of a record whose signup is not verified yet.
 pub(super) const PENDING: &str = "pending";
 /// `notes` once the account is verified.
-const ACTIVE: &str = "active";
+pub(super) const ACTIVE: &str = "active";
 /// `created_by` of signup records (the daily limit counts these).
-const CREATED_BY: &str = "signup";
+pub(super) const CREATED_BY: &str = "signup";
 const DAY_SECS: u64 = 24 * 60 * 60;
 
 /// Everything the flow needs after approval.
@@ -170,7 +170,7 @@ impl Broker {
     }
 
     /// A non-pending login record on `site` whose username is one of `emails`.
-    fn existing_identity_account(
+    pub(super) fn existing_identity_account(
         &self,
         site: &str,
         emails: &[&str],
@@ -190,7 +190,7 @@ impl Broker {
     }
 
     /// Signup records created in the last 24 hours (survives restarts: read from the vault).
-    fn signups_today(&self) -> Result<usize, Status> {
+    pub(super) fn signups_today(&self) -> Result<usize, Status> {
         let now = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map_or(0, |d| d.as_secs());
@@ -227,6 +227,16 @@ impl Broker {
     }
 
     fn add_pending(&self, c: &Ctx, email: &str, pw: &SecretString) -> Result<RecordId, Status> {
+        self.store_pending(&c.record_site, email, pw)
+    }
+
+    /// Store a generated password as a pending signup record (before it is submitted).
+    pub(super) fn store_pending(
+        &self,
+        record_site: &str,
+        email: &str,
+        pw: &SecretString,
+    ) -> Result<RecordId, Status> {
         let mut st = lock(&self.state);
         let st = &mut *st;
         let keys = st.keys.as_ref().ok_or(Status::VaultLocked)?;
@@ -235,7 +245,7 @@ impl Broker {
                 keys,
                 NewRecord {
                     kind: RecordKind::Login,
-                    site: c.record_site.clone(),
+                    site: record_site.to_string(),
                     username: email.to_string(),
                     // The vault takes its own copy; `pw` stays for the fill.
                     secret: SecretString::new(pw.expose().clone()),
@@ -249,7 +259,12 @@ impl Broker {
             })
     }
 
-    fn update_record(&self, id: RecordId, username: Option<String>, notes: Option<String>) {
+    pub(super) fn update_record(
+        &self,
+        id: RecordId,
+        username: Option<String>,
+        notes: Option<String>,
+    ) {
         let mut st = lock(&self.state);
         let st = &mut *st;
         let Some(keys) = st.keys.as_ref() else { return };
@@ -259,7 +274,7 @@ impl Broker {
     }
 
     /// Nothing reached the site: the pending password is useless, drop it.
-    fn drop_record(&self, id: RecordId) {
+    pub(super) fn drop_record(&self, id: RecordId) {
         let mut st = lock(&self.state);
         let st = &mut *st;
         let Some(keys) = st.keys.as_ref() else { return };
@@ -393,10 +408,15 @@ impl Broker {
     }
 
     fn audit_created(&self, c: &Ctx) {
+        self.audit_account_created(&c.client, &c.site);
+    }
+
+    /// The `account_created` audit line.
+    pub(super) fn audit_account_created(&self, client: &str, site: &str) {
         let ev = Event {
-            client: &c.client,
+            client,
             op: "account_created",
-            site: &c.site,
+            site,
             status: "created",
             reason: "",
         };

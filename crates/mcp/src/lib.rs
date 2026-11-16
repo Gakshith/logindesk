@@ -81,6 +81,78 @@ pub struct ClickArgs {
     pub node_ref: u64,
 }
 
+/// `open` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct OpenArgs {
+    /// The http(s) page to open, e.g. a site's sign-up or sign-in page.
+    pub url: String,
+}
+
+/// `type` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct TypeArgs {
+    /// session_id from `open`, `login` or `signup`.
+    pub session_id: String,
+    /// The number in `[ref]` at the start of a snapshot line.
+    #[serde(rename = "ref")]
+    #[schemars(rename = "ref")]
+    pub node_ref: u64,
+    /// Non-secret text (a name, phone number, search, ...), at most 512 characters.
+    pub text: String,
+}
+
+/// Which secret the broker fills. You name the kind; the broker holds the value.
+#[derive(Debug, Clone, Copy, Deserialize, JsonSchema)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretKind {
+    /// The stored password of this site's account (a sign-in password field).
+    Password,
+    /// A new password the broker generates and stores (sign-up password AND its confirm box).
+    NewPassword,
+    /// The user's email address for this site (the broker's identity, plus-addressed).
+    Email,
+    /// The one-time code the site just emailed (the broker reads the mailbox).
+    Code,
+}
+
+impl SecretKind {
+    fn wire(self) -> &'static str {
+        match self {
+            Self::Password => "password",
+            Self::NewPassword => "new_password",
+            Self::Email => "email",
+            Self::Code => "code",
+        }
+    }
+}
+
+/// `fill_secret` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct FillSecretArgs {
+    /// session_id from `open`, `login` or `signup`.
+    pub session_id: String,
+    /// The number in `[ref]` of the field to fill, from the latest snapshot.
+    #[serde(rename = "ref")]
+    #[schemars(rename = "ref")]
+    pub node_ref: u64,
+    /// password | new_password | email | code
+    pub secret: SecretKind,
+    /// For `password` only: username or account_id when the site has several accounts.
+    #[serde(default)]
+    pub account: Option<String>,
+}
+
+/// `press_enter` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct PressEnterArgs {
+    /// session_id from `open`, `login` or `signup`.
+    pub session_id: String,
+    /// The number in `[ref]` of a field in the form to submit.
+    #[serde(rename = "ref")]
+    #[schemars(rename = "ref")]
+    pub node_ref: u64,
+}
+
 /// The MCP server.
 #[derive(Debug, Clone)]
 pub struct Logindesk {
@@ -132,7 +204,9 @@ impl Logindesk {
     /// and never returned: the password and any emailed one-time code go straight into the
     /// broker's own sealed browser. Returns JSON: {"status":"logged_in","session_id":...}
     /// on success, or a status such as denied, vault_locked, email_not_connected,
-    /// needs_user (reason) or failed (reason).
+    /// needs_user (reason) or failed (reason). This is the fast path. If it returns
+    /// failed/field_mapping_failed or the page needs extra steps, drive the page yourself
+    /// with open, snapshot, type, click, fill_secret and press_enter.
     #[tool]
     async fn login(
         &self,
@@ -152,7 +226,9 @@ impl Logindesk {
     /// {"status":"created","account_id":...,"session_id":...,"data":{"email_used":...}} on
     /// success; or denied, awaiting_approval (call wait), email_not_connected, needs_user
     /// (reason) or failed (reason). Refused for banks, government, health, payment and
-    /// email-provider sites.
+    /// email-provider sites. This is the fast path. If it returns failed/field_mapping_failed
+    /// or the form needs extra fields (name, phone, dropdowns, more steps), drive the page
+    /// yourself with open, snapshot, type, click, fill_secret and press_enter.
     #[tool]
     async fn signup(
         &self,
@@ -177,6 +253,78 @@ impl Logindesk {
     ) -> String {
         self.send(&ctx, json!({"op": "wait", "handle": a.handle}))
             .await
+    }
+
+    /// Open a page (e.g. a sign-up or sign-in page) in a new broker browser session and
+    /// return its session_id. No secret, no prompt. Next: call snapshot to read the page.
+    /// Secrets are filled by the broker and never returned.
+    #[tool]
+    async fn open(
+        &self,
+        Parameters(a): Parameters<OpenArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
+        self.send(&ctx, json!({"op": "open", "url": a.url})).await
+    }
+
+    /// Type NON-SECRET text (name, phone, address, username, search) into the field with
+    /// this ref. Read snapshot first to find the ref. Never use this for a password,
+    /// confirm-password, one-time code or the user's own email: those fields are refused
+    /// (failed/field_refused). Use fill_secret for them. Never ask the user for a password
+    /// or code. Secrets are filled by the broker and never returned.
+    #[tool(name = "type")]
+    async fn type_text(
+        &self,
+        Parameters(a): Parameters<TypeArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
+        self.send(
+            &ctx,
+            json!({"op": "type", "session_id": a.session_id, "ref": a.node_ref, "text": a.text}),
+        )
+        .await
+    }
+
+    /// Have the broker fill a secret it holds into the field with this ref. Read snapshot
+    /// first: lines show field kinds like `[12] textbox "Password" (password, empty)` or
+    /// `(code, empty)`. Use secret=password for a sign-in password, new_password for a
+    /// sign-up password AND again for its confirm box (same generated password),
+    /// email for the user's email address on a sign-up form, code for an emailed one-time
+    /// code. You never see the value and must never ask the user for a password or code.
+    /// May ask the user to approve (Touch ID); awaiting_approval means call wait.
+    /// Secrets are filled by the broker and never returned.
+    #[tool]
+    async fn fill_secret(
+        &self,
+        Parameters(a): Parameters<FillSecretArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
+        let mut op = json!({
+            "op": "fill_secret",
+            "session_id": a.session_id,
+            "ref": a.node_ref,
+            "secret": a.secret.wire(),
+        });
+        if let Some(acct) = a.account {
+            op["account"] = acct.into();
+        }
+        self.send(&ctx, op).await
+    }
+
+    /// Press Enter in the field with this ref to submit its form, then wait for the page.
+    /// Take a snapshot afterwards to see the result. Secrets are filled by the broker and
+    /// never returned.
+    #[tool]
+    async fn press_enter(
+        &self,
+        Parameters(a): Parameters<PressEnterArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
+        self.send(
+            &ctx,
+            json!({"op": "press_enter", "session_id": a.session_id, "ref": a.node_ref}),
+        )
+        .await
     }
 
     /// List the stored accounts the broker can log in with: account_id, site and username
