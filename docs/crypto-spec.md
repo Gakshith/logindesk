@@ -203,17 +203,18 @@ Run:
 cd fuzz && cargo +nightly fuzz run vault_file -- -max_total_time=3600 -max_len=65536
 ```
 
-Results for this phase (Apple M1, 2026-11-11):
+Results for this phase (Apple M1, 2026-11-11). "Awake" is wall time minus the sleep intervals in `pmset -g log`. libFuzzer counts sleep as part of a unit's run time, which is where its "slow units" come from. Each saved slow unit replays in 5 ms.
 
-| Run | Code | Real fuzzing time | Executions | Result |
-|---|---|---|---|---|
-| 1 | before the padding fix | 26 min | 11.2 M | **Crash:** `decode_payload` accepted more than the minimal padding, so a payload had several valid encodings (not memory-unsafe). Fixed; regression test `over_padded_payload_is_rejected`. |
-| 2 | after the fix | ~18 min (the Mac slept for the rest) | 4.4 M | no crash |
-| 3 | after the fix | ~2 min (lid closed, clamshell sleep) | 0.75 M | no crash |
-| 4 | after the fix | ~48.5 min (lid closed at 20:04) | 20.9 M | no crash |
+| Run | Code | Start → end (PST) | Wall | Awake (real fuzzing) | Executions | New corpus units | Result |
+|---|---|---|---|---|---|---|---|
+| 1 | before the padding fix | 15:59:38 → 16:25:30 | 26 min | 26 min | 11,198,363 | 7,569 | **Crash:** `decode_payload` accepted extra padding, so a payload had several valid encodings (not memory-unsafe). Fixed in a76988e; regression test `over_padded_payload_is_rejected` |
+| 2 | after the fix | 16:28:06 → 18:02:49 | 5,676 s | 17 min 53 s | 4,405,340 | 1,786 | no crash; the Mac idle-slept at 16:45 |
+| 3 | after the fix | 18:03:33 → 19:16:21 | 4,366 s | 3 min 45 s | 750,021 | 499 | no crash; slept at once, lid closed (clamshell sleep) |
+| 4 | after the fix | 19:17:10 → 20:19:28 | 3,735 s | 48 min 28 s | 20,896,794 | 4,868 | no crash; lid closed at 20:04 |
+| **2–4** | **after the fix** | | | **70 min 6 s** | **26,052,155** | **7,153** | **no crash** |
 
-The macOS power log confirms every "slow unit" lines up with a sleep interval, and each one replays in 5 ms.
+All runs share one corpus directory, so each run starts from everything the previous ones found. At the end it holds 10,299 inputs (52 MiB on disk). Run 4's live corpus was 628 units / 851 KB at 16.7 M executions.
 
-On the fixed code, runs 2–4 add up to **~68 min of real fuzzing and 26.0 M executions with no crash**. They share one growing corpus (1,786 + 499 + 4,868 new units), so coverage carries over between runs.
+**Gate decision (lead, 2026-11-16):** the ~70 min of cumulative fuzzing on the fixed code, split by Mac sleep, meets the "1 h, no crash" gate.
 
-**Open item:** no single run lasted an uninterrupted hour. If the gate requires one, run it with the lid open, on power, under `caffeinate -dims`.
+**Future long runs:** use `caffeinate -i`. It stops idle sleep but not clamshell sleep, so keep the lid open.
