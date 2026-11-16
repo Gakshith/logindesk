@@ -12,7 +12,7 @@
 //!
 //! The report says which marker, which channel and which encoding. A clean report is the pass condition.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 use std::fmt;
 use std::path::{Path, PathBuf};
 
@@ -22,6 +22,11 @@ use rand::RngExt;
 const ALNUM: &[u8] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
 const SPECIALS: [char; 8] = ['"', '\\', '/', '+', '&', '%', ' ', 'é'];
 const WINDOW: usize = 8;
+
+/// Turns marker text into one of its text forms (character by character).
+type Encoder = fn(&str) -> String;
+/// A named text form.
+type TextForm = (&'static str, Encoder);
 
 /// One planted marker.
 #[derive(Clone)]
@@ -60,29 +65,42 @@ impl Marker {
         }
     }
 
-    /// Every text form a secret can take before any binary encoding is applied.
-    fn text_forms(&self) -> Vec<(&'static str, String)> {
-        let raw = self.value.clone();
-        let url = percent_encode(&raw, false);
-        vec![
-            ("raw", raw.clone()),
-            ("json", json_escape(&raw)),
-            ("json-ascii", json_escape_ascii(&raw)),
-            ("url-lower", url_lower_hex(&url)),
-            ("form-url", percent_encode(&raw, true)),
-            ("url", url),
+    /// Every text form a secret can take before any binary encoding is applied, as
+    /// (name, encoder). All encoders work character by character, so encoding a slice of the
+    /// raw marker gives exactly the matching slice of the encoded marker.
+    fn text_forms() -> [TextForm; 7] {
+        [
+            ("raw", |s| s.to_string()),
+            ("json", json_escape),
+            // MCP nests JSON in JSON: a `content[].text` string that itself holds JSON.
+            ("json(json)", |s| json_escape(&json_escape(s))),
+            ("json-ascii", json_escape_ascii),
+            ("url", |s| percent_encode(s, false)),
+            ("form-url", |s| percent_encode(s, true)),
+            ("url-lower", |s| url_lower_hex(&percent_encode(s, false))),
         ]
+    }
+
+    /// 8-char windows of the **raw** marker that hold at least 5 raw alphanumerics, as (offset, window).
+    /// Entropy is counted on marker characters only, never on the digits of an escape like `%C3%A9`.
+    fn raw_windows(&self) -> Vec<(usize, String)> {
+        let cs: Vec<char> = self.value.chars().collect();
+        (0..cs.len().saturating_sub(WINDOW - 1))
+            .map(|i| (i, cs[i..i + WINDOW].iter().collect::<String>()))
+            .filter(|(_, w)| w.chars().filter(char::is_ascii_alphanumeric).count() >= 5)
+            .collect()
     }
 
     /// Every (encoding name, needle) pair the scanner looks for.
     ///
-    /// For each text form (raw, JSON-escaped, JSON `\u`-escaped, URL, form-URL, lower-case URL) it adds:
-    /// - the form itself and every 8-char window of it;
+    /// For each text form (raw, JSON-escaped, JSON-in-JSON, JSON `\u`-escaped, URL, form-URL, lower-case URL):
+    /// - the whole marker in that form;
     /// - base64 and base64url of it at all three byte alignments;
-    /// - hex of it, lower and upper case.
+    /// - hex of it, lower and upper case;
+    /// - each qualifying raw 8-char window (see [`Marker::raw_windows`]) encoded into that form.
     ///
-    /// So composites are caught too: `base64url({"password": marker})` (JWT payloads, cookies, `data:` URLs)
-    /// and `hex(json)` match the JSON form's needles.
+    /// So composites are caught too: `base64url({"password": marker})` (JWT payloads, cookies, `data:` URLs),
+    /// `hex(json)`, and base64 of MCP-style JSON nested in a JSON string.
     pub fn needles(&self) -> Vec<(String, String)> {
         let mut out: Vec<(String, String)> = Vec::new();
         let mut seen = BTreeSet::new();
@@ -91,7 +109,9 @@ impl Marker {
                 out.push((name, needle));
             }
         };
-        for (form, text) in self.text_forms() {
+        let windows = self.raw_windows();
+        for (form, encode) in Self::text_forms() {
+            let text = encode(&self.value);
             push(&mut out, form.to_string(), text.clone());
             let bytes = text.as_bytes();
             // base64: the encoding depends on the text's alignment inside the surrounding data.
@@ -119,17 +139,18 @@ impl Marker {
             let hex: String = bytes.iter().map(|b| format!("{b:02x}")).collect();
             push(&mut out, format!("hex({form})"), hex.to_uppercase());
             push(&mut out, format!("hex({form})"), hex);
-            let cs: Vec<char> = text.chars().collect();
-            for i in 0..cs.len().saturating_sub(WINDOW - 1) {
-                let w: String = cs[i..i + WINDOW].iter().collect();
-                // A window made only of encoding punctuation would match unrelated text.
-                if w.chars().filter(char::is_ascii_alphanumeric).count() >= 5 {
-                    push(&mut out, format!("window8({form})@{i}"), w);
-                }
+            for (i, w) in &windows {
+                push(&mut out, format!("window8({form})@{i}"), encode(w));
             }
         }
         out
     }
+}
+
+/// The 8 bytes at `pos` as a lookup key, if there are 8.
+fn key8(bytes: &[u8], pos: usize) -> Option<u64> {
+    let b: [u8; WINDOW] = bytes.get(pos..pos + WINDOW)?.try_into().ok()?;
+    Some(u64::from_le_bytes(b))
 }
 
 fn percent_encode(s: &str, plus_for_space: bool) -> String {
@@ -161,8 +182,13 @@ fn url_lower_hex(url: &str) -> String {
 }
 
 fn json_escape(s: &str) -> String {
+    // Strip exactly the two quotes serde_json adds; `trim_matches` would also eat an escaped `\"` at an end.
     let quoted = serde_json::to_string(s).unwrap_or_default();
-    quoted.trim_matches('"').to_string()
+    quoted
+        .strip_prefix('"')
+        .and_then(|q| q.strip_suffix('"'))
+        .unwrap_or(&quoted)
+        .to_string()
 }
 
 fn json_escape_ascii(s: &str) -> String {
@@ -376,14 +402,29 @@ impl Canary {
 
     /// Search every channel for every marker in every encoding.
     pub fn scan(&self, cap: &Capture) -> Report {
-        let mut found = BTreeSet::new();
+        // Index every needle by its first 8 bytes (all needles are at least WINDOW bytes long),
+        // then slide over each channel once: one map lookup per position, full compare on a key hit.
+        let mut index: HashMap<u64, Vec<(usize, usize)>> = HashMap::new();
         let prepared: Vec<(&Marker, Vec<(String, String)>)> =
             self.markers.iter().map(|m| (m, m.needles())).collect();
+        for (mi, (_, needles)) in prepared.iter().enumerate() {
+            for (ni, (_, needle)) in needles.iter().enumerate() {
+                if let Some(key) = key8(needle.as_bytes(), 0) {
+                    index.entry(key).or_default().push((mi, ni));
+                }
+            }
+        }
+        let mut found = BTreeSet::new();
         for ch in &cap.channels {
-            let hay = String::from_utf8_lossy(&ch.data);
-            for (m, needles) in &prepared {
-                for (enc, needle) in needles {
-                    if hay.contains(needle.as_str()) {
+            let hay = ch.data.as_slice();
+            for pos in 0..hay.len().saturating_sub(WINDOW - 1) {
+                let Some(hits) = key8(hay, pos).and_then(|k| index.get(&k)) else {
+                    continue;
+                };
+                for &(mi, ni) in hits {
+                    let (m, needles) = &prepared[mi];
+                    let (enc, needle) = &needles[ni];
+                    if hay[pos..].starts_with(needle.as_bytes()) {
                         found.insert(Finding {
                             marker: m.id.clone(),
                             channel: ch.name.clone(),
@@ -505,6 +546,13 @@ mod tests {
                     .collect(),
             ),
             (
+                "base64(json(json)) MCP-style",
+                base64::engine::general_purpose::STANDARD.encode(
+                    serde_json::json!({"result": serde_json::json!({"password": v}).to_string()})
+                        .to_string(),
+                ),
+            ),
+            (
                 "truncated",
                 format!("…{}…", v.chars().skip(3).take(12).collect::<String>()),
             ),
@@ -559,5 +607,21 @@ mod tests {
         assert!(text.contains("CAPTURE ERROR missing:file:/nonexistent/logindesk/audit.jsonl"));
         assert!(text.contains("CAPTURE ERROR missing:dir:/nonexistent/logindesk/tmp"));
         assert!(std::panic::catch_unwind(|| r.assert_clean()).is_err());
+    }
+
+    #[test]
+    fn encoded_windows_are_substrings_of_the_encoded_marker() {
+        for _ in 0..200 {
+            let m = Marker::random("m");
+            for (form, encode) in Marker::text_forms() {
+                let whole = encode(&m.value);
+                for (i, w) in m.raw_windows() {
+                    assert!(
+                        whole.contains(&encode(&w)),
+                        "form {form}, window @{i} is not a slice of the encoded marker"
+                    );
+                }
+            }
+        }
     }
 }

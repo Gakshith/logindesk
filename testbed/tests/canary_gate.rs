@@ -121,3 +121,109 @@ fn panic_output_is_scanned() {
     cap.text("panic", &out.stderr);
     assert!(canary.scan(&cap).found("vault.key", "panic"));
 }
+
+/// A non-English page snapshot the way Phase 5 will capture it: AX-tree JSON with UTF-8 accents,
+/// the same JSON `\u`-escaped, URL-encoded links and a form-encoded body (`%C3%A9`, `%C3%BC`, `+`).
+fn non_english_snapshot() -> String {
+    let labels = [
+        "Adresse e-mail",
+        "Mot de passe oublié ?",
+        "Créer un compte",
+        "Se connecter",
+        "Déjà inscrit ?",
+        "Préférences de sécurité",
+        "Vérifiez votre boîte de réception",
+        "Numéro de téléphone",
+        "Passwort vergessen?",
+        "Größe ändern",
+        "Übersicht",
+        "Zurück zur Startseite",
+        "Lösung anzeigen",
+        "Bestätigungscode eingeben",
+        "Schließen",
+        "Straße und Hausnummer",
+        "Über uns",
+        "Prüfen",
+    ];
+    let mut nodes = Vec::new();
+    for (i, l) in labels.iter().cycle().take(180).enumerate() {
+        let role = ["textbox", "button", "link", "StaticText", "heading"][i % 5];
+        nodes.push(serde_json::json!({"ref": format!("e{i}"), "role": role, "name": l, "value": if role == "textbox" { "••••••••" } else { "" }}));
+    }
+    let utf8 = serde_json::to_string(
+        &serde_json::json!({"url": "http://example.localhost/connexion", "nodes": nodes}),
+    )
+    .expect("json");
+    let ascii: String = utf8
+        .chars()
+        .map(|c| {
+            if c.is_ascii() {
+                c.to_string()
+            } else {
+                c.encode_utf16(&mut [0; 2])
+                    .iter()
+                    .map(|u| format!("\\u{u:04x}"))
+                    .collect()
+            }
+        })
+        .collect();
+    let mut s = format!("{utf8}\n{ascii}\n");
+    for (i, l) in labels.iter().enumerate() {
+        let enc: String = l
+            .bytes()
+            .map(|b| {
+                if b.is_ascii_alphanumeric() {
+                    char::from(b).to_string()
+                } else if b == b' ' {
+                    "+".into()
+                } else {
+                    format!("%{b:02X}")
+                }
+            })
+            .collect();
+        s.push_str(&format!("GET /recherche?q={enc}&page={i}&lang=fr-FR HTTP/1.1\nbody: champ={enc}&f%C3%BCr=%C3%BCber&caf%C3%A9=cr%C3%A8me\n"));
+        s.push_str(&format!("GET /suche?q={} HTTP/1.1\n", enc.to_lowercase()));
+    }
+    s
+}
+
+#[test]
+fn non_english_snapshot_is_clean() {
+    let snap = non_english_snapshot();
+    assert!(
+        snap.len() > 20_000
+            && snap.contains("\\u00e9")
+            && snap.contains("%C3%A9")
+            && snap.contains("%C3%BC")
+            && snap.contains('é')
+    );
+    let mut dirty = Vec::new();
+    for _ in 0..200 {
+        let canary = Canary::new((0..10).map(|i| format!("m{i}")));
+        let mut cap = Capture::new();
+        cap.text("snapshot", &snap);
+        let r = canary.scan(&cap);
+        if !r.is_clean() {
+            dirty.push(r.to_string());
+        }
+    }
+    assert!(
+        dirty.is_empty(),
+        "{} of 200 scans falsely dirty; first:\n{}",
+        dirty.len(),
+        dirty[0]
+    );
+}
+
+/// The leak gate still holds on the same non-English page: a marker hidden in it is found.
+#[test]
+fn leak_inside_non_english_snapshot_is_caught() {
+    let canary = Canary::new(["vault.password"]);
+    let v = canary.get("vault.password").value.clone();
+    let mut snap = non_english_snapshot();
+    let pos = snap.len() / 2;
+    snap.insert_str(pos, &serde_json::to_string(&v).expect("json"));
+    let mut cap = Capture::new();
+    cap.text("snapshot", &snap);
+    assert!(canary.scan(&cap).found("vault.password", "snapshot"));
+}
