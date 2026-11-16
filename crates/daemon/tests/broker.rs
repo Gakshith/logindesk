@@ -20,10 +20,10 @@ use logindesk_daemon::audit;
 use logindesk_daemon::browser::{Browser, Launcher};
 use logindesk_daemon::identity::Identity;
 use logindesk_daemon::mailcfg::MailProvider;
-use logindesk_daemon::proto::{MAX_FRAME, Op, Reply, Request, read_frame, write_frame};
+use logindesk_daemon::proto::{MAX_FRAME, Op, Reply, Request, SecretKind, read_frame, write_frame};
 use logindesk_daemon::server::{self, Server};
 use logindesk_daemon::{Broker, Config, Deps};
-use logindesk_executor::{BrowserConfig, ExecError, PageState, Snapshot};
+use logindesk_executor::{BrowserConfig, ExecError, PageState, SecretField, Snapshot};
 use logindesk_mail::{MailError, MailQuery, MailSource, RawMessage};
 use logindesk_policy::{Grants, Tier};
 use logindesk_vault::{KdfParams, NewRecord, RecordKind, Vault};
@@ -46,7 +46,20 @@ struct Calls {
     pending_seen_before_submit: usize,
     /// Order of navigate / check / approve / fill, as they happened.
     events: Vec<&'static str>,
+    /// `type` calls: (ref, text).
+    typed: Vec<(u64, String)>,
+    /// `fill_at` calls: (ref, field kind, value).
+    at_fills: Vec<(u64, SecretField, String)>,
+    /// `press_enter_at` refs.
+    enters: Vec<u64>,
 }
+
+/// The fake page used by agent-driven form tests: which ref is which field.
+const REF_PASSWORD: u64 = 12;
+const REF_EMAIL: u64 = 13;
+const REF_CODE: u64 = 14;
+const REF_CONFIRM: u64 = 15;
+const REF_NAME: u64 = 16;
 
 /// Called with the generated password inside `fill_signup`, before "submit".
 type Probe = Box<dyn Fn(&str) -> bool + Send + Sync>;
@@ -54,6 +67,8 @@ type Probe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 struct Script {
     /// What the login page looks like before any fill.
     landing: PageState,
+    /// The page after agent-driven fills (what `close` sees).
+    after_forms: Mutex<PageState>,
     /// The landing page has no text field at all.
     fieldless: bool,
     after_fill: Result<PageState, ExecError>,
@@ -107,6 +122,9 @@ impl Browser for FakeBrowser {
     }
     fn page_state(&mut self) -> Result<PageState, ExecError> {
         let mut c = self.script.calls.lock().unwrap();
+        if !c.at_fills.is_empty() {
+            return Ok(*self.script.after_forms.lock().unwrap());
+        }
         if c.fills.is_empty() && c.signup_fills.is_empty() {
             c.events.push("check");
             Ok(self.script.landing)
@@ -138,6 +156,46 @@ impl Browser for FakeBrowser {
             .fills
             .push((site.into(), username.into()));
         self.script.after_fill
+    }
+    fn type_text(&mut self, _site: &str, node_ref: u64, text: &str) -> Result<(), ExecError> {
+        // Same rule as the executor: no text into a password or code field.
+        if [REF_PASSWORD, REF_CONFIRM, REF_CODE].contains(&node_ref) {
+            return Err(ExecError::Refused);
+        }
+        self.script
+            .calls
+            .lock()
+            .unwrap()
+            .typed
+            .push((node_ref, text.into()));
+        Ok(())
+    }
+    fn fill_at(
+        &mut self,
+        _site: &str,
+        node_ref: u64,
+        field: SecretField,
+        value: &SecretString,
+    ) -> Result<(), ExecError> {
+        let fits = match field {
+            SecretField::Password => [REF_PASSWORD, REF_CONFIRM].contains(&node_ref),
+            SecretField::Code => node_ref == REF_CODE,
+            SecretField::Email => node_ref == REF_EMAIL,
+        };
+        if !fits {
+            return Err(ExecError::Refused);
+        }
+        self.script
+            .calls
+            .lock()
+            .unwrap()
+            .at_fills
+            .push((node_ref, field, value.expose().clone()));
+        Ok(())
+    }
+    fn press_enter_at(&mut self, _site: &str, node_ref: u64) -> Result<(), ExecError> {
+        self.script.calls.lock().unwrap().enters.push(node_ref);
+        Ok(())
     }
     fn fill_otp(&mut self, _site: &str, code: &SecretString) -> Result<PageState, ExecError> {
         self.script
@@ -413,6 +471,7 @@ fn harness(o: Opts) -> H {
     });
     let script = Arc::new(Script {
         landing: o.landing,
+        after_forms: Mutex::new(PageState::LoggedIn),
         fieldless: o.fieldless,
         after_fill: o.after_fill,
         signup_states: Mutex::new(o.signup_states.into()),
@@ -1382,4 +1441,350 @@ fn the_prompt_and_the_audit_name_the_agent() {
         audit.contains(r#""client":"claude-code","op":"login""#),
         "{audit}"
     );
+}
+
+// ---------- agent-driven forms (contract §12) ----------
+
+fn open(h: &H, url: &str) -> Reply {
+    h.broker.handle(&req(Op::Open { url: url.into() }))
+}
+
+fn fill(h: &H, sid: &str, node_ref: u64, secret: SecretKind) -> Reply {
+    h.broker.handle(&req(Op::FillSecret {
+        session_id: sid.into(),
+        node_ref,
+        secret,
+        account: None,
+    }))
+}
+
+fn at_fills(h: &H) -> Vec<(u64, SecretField, String)> {
+    h.script.calls.lock().unwrap().at_fills.clone()
+}
+
+#[test]
+fn open_fences_non_http_urls_and_opens_a_session() {
+    let h = harness(Opts::default());
+    for bad in [
+        "file:///etc/passwd",
+        "javascript:alert(1)",
+        "data:text/html,hi",
+        "not a url",
+        "http://127.0.0.1/",
+    ] {
+        assert_eq!(tag(&open(&h, bad)), "failed/fence_blocked", "{bad}");
+    }
+    assert_eq!(h.script.calls.lock().unwrap().launches, 0);
+    let r = open(&h, "https://www.example.com/signup");
+    assert_eq!(tag(&r), "ok");
+    assert_eq!(r.session_id.as_ref().unwrap().len(), 32);
+    assert_eq!(r.data.unwrap()["url"], "https://www.example.com/signup");
+    assert_eq!(h.asked.load(Ordering::SeqCst), 0, "open never prompts");
+    assert_eq!(h.broker.session_count(), 1);
+}
+
+#[test]
+fn type_reaches_the_page_but_never_the_audit() {
+    let h = harness(Opts::default());
+    let sid = open(&h, "https://example.com/signup").session_id.unwrap();
+    let text = "Ann Example TYPED-7c1e +1 555 0100";
+    let r = h.broker.handle(&req(Op::Type {
+        session_id: sid.clone(),
+        node_ref: REF_NAME,
+        text: text.into(),
+    }));
+    assert_eq!(tag(&r), "ok");
+    assert_eq!(
+        h.script.calls.lock().unwrap().typed,
+        vec![(REF_NAME, text.to_string())]
+    );
+    // Text into a password field: the executor's refusal passes through.
+    let r = h.broker.handle(&req(Op::Type {
+        session_id: sid.clone(),
+        node_ref: REF_PASSWORD,
+        text: "guessed".into(),
+    }));
+    assert_eq!(tag(&r), "failed/field_refused");
+    // Too long: refused before the browser.
+    let r = h.broker.handle(&req(Op::Type {
+        session_id: sid.clone(),
+        node_ref: REF_NAME,
+        text: "x".repeat(513),
+    }));
+    assert_eq!(tag(&r), "failed/internal");
+    assert_eq!(h.script.calls.lock().unwrap().typed.len(), 1);
+    let r = h.broker.handle(&req(Op::PressEnter {
+        session_id: sid,
+        node_ref: REF_NAME,
+    }));
+    assert_eq!(tag(&r), "ok");
+    assert_eq!(h.script.calls.lock().unwrap().enters, vec![REF_NAME]);
+
+    let audit = std::fs::read_to_string(h.tmp.0.join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#""op":"type","site":"example.com","status":"ok""#));
+    assert!(audit.contains(r#""op":"press_enter","site":"example.com","status":"ok""#));
+    assert!(!audit.contains("TYPED-7c1e") && !audit.contains("guessed"));
+}
+
+#[test]
+fn password_fill_gates_deny_ask_auto_and_reuses_approval_in_a_session() {
+    // deny: nothing filled, no prompt.
+    let h = harness(Opts {
+        grants: &[("example.com", Tier::Deny)],
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/login").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::Password)),
+        "failed/grant_denied"
+    );
+    assert!(at_fills(&h).is_empty());
+    assert_eq!(h.asked.load(Ordering::SeqCst), 0);
+
+    // ask + no: denied, nothing filled.
+    let h = harness(Opts {
+        grants: &[],
+        approve: ApprovalOutcome::Denied,
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/login").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::Password)),
+        "denied"
+    );
+    assert!(at_fills(&h).is_empty());
+
+    // ask + yes: filled; the prompt names the agent; a second fill in the same
+    // session (same account) asks nothing.
+    let h = harness(Opts {
+        grants: &[],
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/login").session_id.unwrap();
+    let mut r1 = req(Op::FillSecret {
+        session_id: sid.clone(),
+        node_ref: REF_PASSWORD,
+        secret: SecretKind::Password,
+        account: None,
+    });
+    r1.client_name = "claude-code".into();
+    let r = h.broker.handle(&r1);
+    assert_eq!(tag(&r), "ok");
+    assert!(r.account_id.is_some());
+    assert!(
+        !r.to_bytes()
+            .windows(8)
+            .any(|w| MARKER.as_bytes().windows(8).any(|m| m == w))
+    );
+    assert_eq!(h.asked.load(Ordering::SeqCst), 1);
+    assert!(h.prompts.lock().unwrap()[0].contains("\"claude-code\" (unverified)"));
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_CONFIRM, SecretKind::Password)),
+        "ok"
+    );
+    assert_eq!(
+        h.asked.load(Ordering::SeqCst),
+        1,
+        "approval reused in the session"
+    );
+    let f = at_fills(&h);
+    assert_eq!(f.len(), 2);
+    assert!(
+        f.iter()
+            .all(|(_, k, v)| *k == SecretField::Password && v == MARKER)
+    );
+    // A new session needs a new approval.
+    let sid2 = open(&h, "https://example.com/login").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid2, REF_PASSWORD, SecretKind::Password)),
+        "ok"
+    );
+    assert_eq!(h.asked.load(Ordering::SeqCst), 2);
+    // A password into a non-password field: refused by the executor, passed through.
+    assert_eq!(
+        tag(&fill(&h, &sid2, REF_EMAIL, SecretKind::Password)),
+        "failed/field_refused"
+    );
+
+    // auto: no prompt.
+    let h = harness(Opts::default());
+    let sid = open(&h, "https://example.com/login").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::Password)),
+        "ok"
+    );
+    assert_eq!(h.asked.load(Ordering::SeqCst), 0);
+}
+
+#[test]
+fn new_password_is_pending_before_fill_reused_for_confirm_and_confirmed_on_close() {
+    let h = harness(Opts {
+        accounts: &[],
+        rules: Some("minlength: 14; maxlength: 14; required: digit; allowed: upper"),
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://www.example.com/join").session_id.unwrap();
+    let r = fill(&h, &sid, REF_EMAIL, SecretKind::Email);
+    assert_eq!(tag(&r), "ok");
+    assert_eq!(r.data.unwrap()["email_used"], "you+example@mail.test");
+    let r = fill(&h, &sid, REF_PASSWORD, SecretKind::NewPassword);
+    assert_eq!(tag(&r), "ok");
+    let acct = r.account_id.clone().unwrap();
+    // On disk, pending, for the plus-address, before any submit.
+    assert_eq!(
+        signup_records(&h),
+        vec![("you+example@mail.test".to_string(), "pending".to_string())]
+    );
+    let r = fill(&h, &sid, REF_CONFIRM, SecretKind::NewPassword);
+    assert_eq!(tag(&r), "ok");
+    assert_eq!(r.account_id.unwrap(), acct, "same record");
+    let f = at_fills(&h);
+    assert_eq!(
+        f[0],
+        (
+            REF_EMAIL,
+            SecretField::Email,
+            "you+example@mail.test".into()
+        )
+    );
+    assert_eq!(f[1].2, f[2].2, "the confirm box gets the same password");
+    assert_eq!(f[1].2.len(), 14);
+    assert_eq!(signup_records(&h).len(), 1);
+    assert_eq!(h.asked.load(Ordering::SeqCst), 0, "auto signup grant");
+
+    // Still on the signup form when closed: stays pending.
+    *h.script.after_forms.lock().unwrap() = PageState::SignupForm;
+    h.broker.handle(&req(Op::CloseSession {
+        session_id: sid.clone(),
+    }));
+    assert_eq!(signup_records(&h)[0].1, "pending");
+
+    // Same again, closed after the form went away: confirmed.
+    let h = harness(Opts {
+        accounts: &[],
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/join").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::NewPassword)),
+        "ok"
+    );
+    *h.script.after_forms.lock().unwrap() = PageState::LoggedIn;
+    h.broker.handle(&req(Op::CloseSession { session_id: sid }));
+    assert_eq!(
+        signup_records(&h),
+        vec![("you+example@mail.test".to_string(), "active".to_string())]
+    );
+    let audit = std::fs::read_to_string(h.tmp.0.join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#""op":"account_created","site":"example.com""#));
+    let pw = at_fills(&h)[0].2.clone();
+    assert!(!audit.contains(&pw));
+}
+
+#[test]
+fn new_password_gates_like_signup() {
+    // Blocklisted site: refused before any prompt or record.
+    let h = harness(Opts::default());
+    let sid = open(&h, "https://www.paypal.com/signup")
+        .session_id
+        .unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::NewPassword)),
+        "failed/grant_denied"
+    );
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_EMAIL, SecretKind::Email)),
+        "failed/grant_denied"
+    );
+    // The identity already has an account here: refused.
+    let h = harness(Opts {
+        accounts: &[("example.com", "you+example@mail.test")],
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/join").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::NewPassword)),
+        "failed/account_ambiguous"
+    );
+    // Daily limit.
+    let h = harness(Opts {
+        accounts: &[],
+        signups_per_day: 0,
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/join").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::NewPassword)),
+        "failed/rate_limited"
+    );
+    // Ask + no: no record.
+    let h = harness(Opts {
+        accounts: &[],
+        signup_grants: &[],
+        approve: ApprovalOutcome::Denied,
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/join").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_PASSWORD, SecretKind::NewPassword)),
+        "denied"
+    );
+    assert!(signup_records(&h).is_empty());
+    // A refused field: the pending record is dropped again.
+    let h = harness(Opts {
+        accounts: &[],
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/join").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_EMAIL, SecretKind::NewPassword)),
+        "failed/field_refused"
+    );
+    assert!(signup_records(&h).is_empty());
+}
+
+#[test]
+fn code_fill_needs_a_mailbox_and_the_login_tier() {
+    let h = harness(Opts {
+        grants: &[],
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/verify").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_CODE, SecretKind::Code)),
+        "email_not_connected"
+    );
+    assert_eq!(
+        h.asked.load(Ordering::SeqCst),
+        0,
+        "no prompt without a mailbox"
+    );
+
+    let h = harness(Opts {
+        mail: MailMode::Code("731904"),
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/verify").session_id.unwrap();
+    assert_eq!(tag(&fill(&h, &sid, REF_CODE, SecretKind::Code)), "ok");
+    assert_eq!(
+        at_fills(&h),
+        vec![(REF_CODE, SecretField::Code, "731904".into())]
+    );
+    // Used codes are not filled twice.
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_CODE, SecretKind::Code)),
+        "failed/timeout"
+    );
+
+    let h = harness(Opts {
+        grants: &[("example.com", Tier::Deny)],
+        mail: MailMode::Code("731904"),
+        ..Opts::default()
+    });
+    let sid = open(&h, "https://example.com/verify").session_id.unwrap();
+    assert_eq!(
+        tag(&fill(&h, &sid, REF_CODE, SecretKind::Code)),
+        "failed/grant_denied"
+    );
+    assert!(at_fills(&h).is_empty());
 }

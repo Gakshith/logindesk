@@ -155,6 +155,37 @@ domain (`fence_blocked`) before the browser sees it. Sessions idle for 30 min
 close. `logindesk daemon --lock-after N` drops the keys after N minutes with no
 request.
 
+## Agent-driven forms (contract §12)
+
+For pages `login` / `signup` cannot map, the agent drives the page and the
+broker fills only secrets, into a field ref from `snapshot`.
+
+| `op` | Fields | Reply |
+|---|---|---|
+| `open` | `url` (http/https, else `fence_blocked`) | `ok` + `session_id`, `data.url`. No prompt. |
+| `type` | `session_id`, `ref`, `text` (≤ 512 chars) | `ok`; password/code fields → `failed/field_refused` |
+| `fill_secret` | `session_id`, `ref`, `secret`, `account`? | `ok` (+ `account_id`; `data.email_used` for `email`) |
+| `press_enter` | `session_id`, `ref` | `ok` + `data.url` |
+
+`secret`:
+- `password`: the site's stored account, gated by the **login** tier
+  (`ask` = Touch ID naming the client). One approval covers that session and
+  account until it closes.
+- `code`: the next unused emailed code from the site (`email_not_connected`
+  without a mailbox, checked before any prompt). Login tier, once per session.
+  A link instead of a code is opened in the session (on the site only).
+- `email`: the identity's plus-address. Signup tier and blocklist.
+- `new_password`: signup tier, blocklist, duplicate-identity refusal
+  (`account_ambiguous`), daily limit. The generated password is stored as a
+  **pending** record before it is filled; a second `new_password` in the
+  session (the confirm box) fills the same password. On close the record
+  becomes `active` (+ `account_created` audit line) unless the page is still
+  a signup form, in which case it stays pending.
+
+One signup approval per session covers `email` and `new_password`. `type`
+text and every secret stay out of the audit log: a line records only the op,
+the site and the status.
+
 ## Audit log
 
 One line per request, including refused ones:

@@ -3,7 +3,7 @@
 
 use logindesk_approver::ApprovalToken;
 use logindesk_core::SecretString;
-use logindesk_executor::{BrowserConfig, ExecError, PageState, Session, Snapshot};
+use logindesk_executor::{BrowserConfig, ExecError, PageState, SecretField, Session, Snapshot};
 
 /// One live browser page.
 pub trait Browser: Send {
@@ -38,6 +38,18 @@ pub trait Browser: Send {
         password: &SecretString,
         token: ApprovalToken,
     ) -> Result<PageState, ExecError>;
+    /// Type non-secret text into a field (the executor refuses password and code fields).
+    fn type_text(&mut self, site: &str, node_ref: u64, text: &str) -> Result<(), ExecError>;
+    /// Fill a secret into a field that suits `field` (else `Refused`).
+    fn fill_at(
+        &mut self,
+        site: &str,
+        node_ref: u64,
+        field: SecretField,
+        value: &SecretString,
+    ) -> Result<(), ExecError>;
+    /// Press Enter in a field and wait for any navigation.
+    fn press_enter_at(&mut self, site: &str, node_ref: u64) -> Result<(), ExecError>;
     /// Close the browser.
     fn close(self: Box<Self>);
 }
@@ -98,6 +110,21 @@ impl Browser for Session {
         token: ApprovalToken,
     ) -> Result<PageState, ExecError> {
         Session::fill_signup(self, site, email, name, password, token)
+    }
+    fn type_text(&mut self, site: &str, node_ref: u64, text: &str) -> Result<(), ExecError> {
+        Session::type_text(self, site, node_ref, text)
+    }
+    fn fill_at(
+        &mut self,
+        site: &str,
+        node_ref: u64,
+        field: SecretField,
+        value: &SecretString,
+    ) -> Result<(), ExecError> {
+        Session::fill_at(self, site, node_ref, field, value)
+    }
+    fn press_enter_at(&mut self, site: &str, node_ref: u64) -> Result<(), ExecError> {
+        Session::press_enter_at(self, site, node_ref)
     }
     fn close(self: Box<Self>) {
         Session::close(*self);

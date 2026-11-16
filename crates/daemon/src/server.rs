@@ -21,7 +21,7 @@ pub const SOCKET: &str = "daemon.sock";
 /// Token file name in the data dir.
 pub const TOKEN: &str = "client.token";
 
-const OPS: [&str; 10] = [
+const OPS: [&str; 14] = [
     "login",
     "signup",
     "wait",
@@ -32,6 +32,10 @@ const OPS: [&str; 10] = [
     "close_session",
     "lock",
     "ping",
+    "open",
+    "type",
+    "fill_secret",
+    "press_enter",
 ];
 
 /// How often idle sessions and `lock_after` are checked.

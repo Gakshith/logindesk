@@ -9,6 +9,7 @@
 //! answer at once; `ask` prompts on its own thread so an unanswered prompt
 //! becomes an `awaiting_approval` handle the agent can `wait` on.
 
+mod forms;
 mod gate;
 mod signup;
 
@@ -109,6 +110,8 @@ struct Slot {
     site: String,
     browser: Mutex<Option<Box<dyn Browser>>>,
     last_used: Mutex<Instant>,
+    /// Agent-driven form state: approvals given, the pending generated password.
+    forms: Mutex<forms::FormState>,
 }
 
 impl Slot {
@@ -277,6 +280,28 @@ impl Broker {
             Op::CloseSession { session_id } => self.close_session(session_id),
             Op::Signup { site, url } => self.signup(&req.client_name, site, url.as_deref()),
             Op::Wait { handle } => self.wait(handle),
+            Op::Open { url } => self.open(url),
+            Op::Type {
+                session_id,
+                node_ref,
+                text,
+            } => self.type_text(session_id, *node_ref, text),
+            Op::FillSecret {
+                session_id,
+                node_ref,
+                secret,
+                account,
+            } => self.fill_secret(
+                &req.client_name,
+                session_id,
+                *node_ref,
+                *secret,
+                account.as_deref(),
+            ),
+            Op::PressEnter {
+                session_id,
+                node_ref,
+            } => self.press_enter(session_id, *node_ref),
         };
         self.audit(&req.client_name, req.op.name(), &out.site, &out.reply);
         out.reply
@@ -332,7 +357,7 @@ impl Broker {
                 .collect()
         };
         for s in idle {
-            s.close();
+            self.close_slot(&s);
         }
         self.purge_pending(now);
     }
@@ -345,7 +370,7 @@ impl Broker {
             st.sessions.drain().map(|(_, s)| s).collect()
         };
         for s in all {
-            s.close();
+            self.close_slot(&s);
         }
         self.lock_keys();
     }
@@ -454,7 +479,7 @@ impl Broker {
                 .and_then(|id| Self::forget(&mut st, &id))
         };
         if let Some(s) = old {
-            s.close();
+            self.close_slot(&s);
         }
     }
 
@@ -559,6 +584,7 @@ impl Broker {
             site: site.to_string(),
             browser: Mutex::new(Some(browser)),
             last_used: Mutex::new(Instant::now()),
+            forms: Mutex::new(forms::FormState::new()),
         });
         let mut st = lock(&self.state);
         st.sessions.insert(id, slot);
@@ -595,38 +621,41 @@ impl Broker {
         site: &str,
         started: SystemTime,
     ) -> Result<PageState, Status> {
+        let since = started
+            .checked_sub(OTP_SINCE_SLACK)
+            .unwrap_or(SystemTime::UNIX_EPOCH);
+        match self.next_mail_secret(site, since)? {
+            MailSecret::Code(code) => match b.fill_otp(site, &code) {
+                // The code field is still there: refused.
+                Ok(PageState::NeedsOtp) => Ok(PageState::Rejected),
+                Ok(st) => Ok(st),
+                Err(e) => Err(exec_status(e)),
+            },
+            MailSecret::Link(link) => {
+                if !link_on_site(&link, site) {
+                    return Err(failed(FailReason::FenceBlocked));
+                }
+                b.navigate(link.expose()).map_err(exec_status)?;
+                b.page_state().map_err(exec_status)
+            }
+        }
+    }
+
+    /// Wait (up to `otp_wait_max`) for the newest unused code or link from `site`
+    /// received after `since`. `UsedCodes` keeps a code from being used twice.
+    fn next_mail_secret(&self, site: &str, since: SystemTime) -> Result<MailSecret, Status> {
         let mail = self.deps.mail.current().ok_or(Status::EmailNotConnected)?;
         let q = MailQuery {
             site: site.to_string(),
-            since: started
-                .checked_sub(OTP_SINCE_SLACK)
-                .unwrap_or(SystemTime::UNIX_EPOCH),
+            since,
         };
         let deadline = Instant::now() + self.cfg.otp_wait_max;
         loop {
             match self.poll_once(mail.as_ref(), &q) {
                 Poll::Wait => {}
                 Poll::Done(s) => return Err(s),
-                Poll::Code(code) => {
-                    return match b.fill_otp(site, &code) {
-                        // The code field is still there: refused.
-                        Ok(PageState::NeedsOtp) => Ok(PageState::Rejected),
-                        Ok(st) => Ok(st),
-                        Err(e) => Err(exec_status(e)),
-                    };
-                }
-                Poll::Link(link) => {
-                    let on_site = url::Url::parse(link.expose())
-                        .ok()
-                        .filter(|u| u.scheme() == "https" || u.scheme() == "http")
-                        .and_then(|u| url_site(&u))
-                        .is_some_and(|d| d == site);
-                    if !on_site {
-                        return Err(failed(FailReason::FenceBlocked));
-                    }
-                    b.navigate(link.expose()).map_err(exec_status)?;
-                    return b.page_state().map_err(exec_status);
-                }
+                Poll::Code(code) => return Ok(MailSecret::Code(code)),
+                Poll::Link(link) => return Ok(MailSecret::Link(link)),
             }
             let now = Instant::now();
             if now >= deadline {
@@ -721,7 +750,7 @@ impl Broker {
         match slot {
             Some(s) => {
                 let site = s.site.clone();
-                s.close();
+                self.close_slot(&s);
                 Outcome::new(&Status::Ok, site)
             }
             None => Outcome::new(&failed(FailReason::SessionNotFound), ""),
@@ -732,6 +761,21 @@ impl Broker {
     pub fn session_count(&self) -> usize {
         lock(&self.state).sessions.len()
     }
+}
+
+/// What the mailbox gave: a code to fill, or a link to open.
+enum MailSecret {
+    Code(SecretString),
+    Link(SecretString),
+}
+
+/// An http(s) link on `site`'s registrable domain.
+fn link_on_site(link: &SecretString, site: &str) -> bool {
+    url::Url::parse(link.expose())
+        .ok()
+        .filter(|u| u.scheme() == "https" || u.scheme() == "http")
+        .and_then(|u| url_site(&u))
+        .is_some_and(|d| d == site)
 }
 
 enum Poll {

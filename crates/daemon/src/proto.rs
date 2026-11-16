@@ -94,6 +94,42 @@ pub enum Op {
         #[serde(default)]
         url: Option<String>,
     },
+    /// Open a page in a new session (no secret, no prompt).
+    Open {
+        /// http(s) URL; the session's site is its registrable domain.
+        url: String,
+    },
+    /// Type non-secret text into a field (never a password or code field).
+    Type {
+        /// Session from `open`, `login` or `signup`.
+        session_id: String,
+        /// The `[ref]` from a snapshot line.
+        #[serde(rename = "ref")]
+        node_ref: u64,
+        /// At most [`MAX_TYPE_CHARS`] characters. Never logged or audited.
+        text: String,
+    },
+    /// Have the broker fill a secret it holds into a field.
+    FillSecret {
+        /// Session from `open`, `login` or `signup`.
+        session_id: String,
+        /// The `[ref]` from a snapshot line.
+        #[serde(rename = "ref")]
+        node_ref: u64,
+        /// Which secret.
+        secret: SecretKind,
+        /// Username or account id for `password`, when the site has several.
+        #[serde(default)]
+        account: Option<String>,
+    },
+    /// Press Enter in a field (submits its form).
+    PressEnter {
+        /// Session from `open`, `login` or `signup`.
+        session_id: String,
+        /// The `[ref]` from a snapshot line.
+        #[serde(rename = "ref")]
+        node_ref: u64,
+    },
     /// Wait for a flow that returned `awaiting_approval`.
     Wait {
         /// The handle from `awaiting_approval`.
@@ -120,12 +156,34 @@ impl Op {
             Self::Navigate { .. } => "navigate",
             Self::Click { .. } => "click",
             Self::Signup { .. } => "signup",
+            Self::Open { .. } => "open",
+            Self::Type { .. } => "type",
+            Self::FillSecret { .. } => "fill_secret",
+            Self::PressEnter { .. } => "press_enter",
             Self::Wait { .. } => "wait",
             Self::CloseSession { .. } => "close_session",
             Self::Lock => "lock",
             Self::Ping => "ping",
         }
     }
+}
+
+/// Longest text `type` accepts.
+pub const MAX_TYPE_CHARS: usize = 512;
+
+/// The secret `fill_secret` fills. The agent names the kind, never the value.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Deserialize, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretKind {
+    /// The stored password of the session site's account (gated like `login`).
+    Password,
+    /// A generated password for a new account, stored pending (gated like `signup`).
+    /// A second one in the same session (the confirm box) is the same password.
+    NewPassword,
+    /// The identity's plus-address for this site (gated like `signup`).
+    Email,
+    /// An emailed one-time code from the session's site (gated by the login tier).
+    Code,
 }
 
 /// A request frame.
