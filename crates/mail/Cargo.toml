@@ -11,6 +11,10 @@ publish.workspace = true
 [dependencies]
 logindesk-core = { path = "../core" }
 logindesk-policy = { path = "../policy" }
+serde_json = { workspace = true }
+ureq = { workspace = true }
+url = { workspace = true }
+zeroize = { workspace = true }
 
 [lints]
 workspace = true

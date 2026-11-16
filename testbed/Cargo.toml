@@ -28,4 +28,5 @@ tower = { workspace = true, features = ["util"] }
 logindesk-executor = { path = "../crates/executor" }
 logindesk-approver = { path = "../crates/approver" }
 logindesk-core = { path = "../crates/core" }
+logindesk-mail = { path = "../crates/mail" }
 logindesk-policy = { path = "../crates/policy" }
