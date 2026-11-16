@@ -66,7 +66,7 @@ fn header<'a>(hs: &'a [(String, Zeroizing<String>)], name: &str) -> Option<&'a s
 }
 
 /// Split at the first empty line (CRLF or LF).
-fn split_head_body(raw: &[u8]) -> (&[u8], &[u8]) {
+pub(crate) fn split_head_body(raw: &[u8]) -> (&[u8], &[u8]) {
     let mut i = 0;
     while i < raw.len() {
         if raw[i] == b'\n' {
@@ -83,7 +83,7 @@ fn split_head_body(raw: &[u8]) -> (&[u8], &[u8]) {
 }
 
 /// Unfolded `(name, value)` pairs, in order.
-fn parse_headers(head: &[u8]) -> Vec<(String, Zeroizing<String>)> {
+pub(crate) fn parse_headers(head: &[u8]) -> Vec<(String, Zeroizing<String>)> {
     let text = Zeroizing::new(String::from_utf8_lossy(head).into_owned());
     let mut out: Vec<(String, Zeroizing<String>)> = Vec::new();
     for line in text.split('\n') {

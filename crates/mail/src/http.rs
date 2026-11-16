@@ -18,7 +18,7 @@ const TIMEOUT: Duration = Duration::from_secs(10);
 /// A message list larger than this is refused.
 const MAX_LIST_BYTES: u64 = 4 * 1024 * 1024;
 
-fn agent() -> ureq::Agent {
+pub(crate) fn agent() -> ureq::Agent {
     ureq::Agent::config_builder()
         .timeout_global(Some(TIMEOUT))
         .http_status_as_error(true)
@@ -62,6 +62,19 @@ pub fn map_err(e: &ureq::Error) -> MailError {
         ureq::Error::StatusCode(c) if *c >= 500 => MailError::Transient,
         _ => MailError::Internal,
     }
+}
+
+/// Read a JSON body of any status (size-capped).
+pub(crate) fn read_json_any(
+    resp: &mut ureq::http::Response<ureq::Body>,
+) -> Result<Value, MailError> {
+    let bytes = resp
+        .body_mut()
+        .with_config()
+        .limit(MAX_LIST_BYTES)
+        .read_to_vec()
+        .map_err(|e| map_err(&e))?;
+    serde_json::from_slice(&bytes).map_err(|_| MailError::Internal)
 }
 
 fn get_json(agent: &ureq::Agent, url: &str) -> Result<Value, MailError> {

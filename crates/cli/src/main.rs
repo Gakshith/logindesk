@@ -8,6 +8,7 @@
 
 mod doctor;
 mod install;
+mod connect;
 mod paths;
 mod prompt;
 
@@ -106,6 +107,11 @@ enum Cmd {
         #[arg(long)]
         popup: bool,
     },
+    /// Connect a real mailbox (Gmail or IMAP) for emailed codes; secrets go into the vault.
+    #[command(subcommand)]
+    Connect(connect::ConnectCmd),
+    /// Forget the connected mailbox: delete its vault secrets and mail.json.
+    Disconnect,
     /// Log in to a site through the daemon (as client "cli") and print the reply.
     Login {
         /// Host or URL.
@@ -316,6 +322,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         }
         Cmd::Uninstall { client, dry_run } => install::cmd(client, None, true, dry_run),
         Cmd::Doctor { popup } => doctor::cmd(&path, &data_dir(&path), popup),
+        Cmd::Connect(cmd) => connect::run(&path, &data_dir(&path), cmd, &mut prompt),
+        Cmd::Disconnect => connect::disconnect(&path, &data_dir(&path), &mut prompt),
         Cmd::Login { site, account } => {
             let mut op = json!({"op": "login", "site": site});
             if let Some(a) = account {

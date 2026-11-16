@@ -6,10 +6,17 @@
 //! FROZEN API (docs/contract.md §7). Parser rules and source details: docs/mail.md.
 #![forbid(unsafe_code)]
 
+mod auth;
+mod gmail;
 mod http;
+mod imap;
 mod mime;
+pub mod oauth;
 mod otp;
 mod time;
+
+pub use gmail::{GMAIL_API_BASE, GOOGLE_TOKEN_URL, GmailAuth, GmailRestSource};
+pub use imap::{ImapAuth, ImapSource};
 
 #[cfg(test)]
 mod tests;

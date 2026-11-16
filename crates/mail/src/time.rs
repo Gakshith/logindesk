@@ -136,6 +136,27 @@ pub fn format_rfc2822(secs: u64) -> String {
     )
 }
 
+/// IMAP `SINCE` date (`16-Nov-2026`, UTC day).
+pub fn imap_date(t: std::time::SystemTime) -> String {
+    const MON: [&str; 12] = [
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec",
+    ];
+    let secs = t.duration_since(UNIX_EPOCH).map_or(0, |d| d.as_secs());
+    let (y, m, d) = civil_from_days(i64::try_from(secs / 86_400).unwrap_or(0));
+    format!("{d}-{}-{y}", MON[usize::try_from(m - 1).unwrap_or(0)])
+}
+
+/// IMAP `INTERNALDATE` (`16-Nov-2026 10:00:00 +0000`, day may be space-padded).
+pub fn parse_imap_internal(s: &str) -> Option<SystemTime> {
+    let s = s.trim();
+    let (date, rest) = s.split_once(' ')?;
+    let mut dp = date.split('-');
+    let d = dp.next()?.trim();
+    let mon = dp.next()?;
+    let y = dp.next()?;
+    parse_rfc2822(&format!("{d} {mon} {y} {}", rest.trim()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -157,5 +178,11 @@ mod tests {
             Some(UNIX_EPOCH + Duration::from_secs(1_794_441_601))
         );
         assert!(parse_rfc3339("not a date").is_none());
+        assert_eq!(imap_date(a), "12-Nov-2026");
+        assert_eq!(parse_imap_internal("12-Nov-2026 00:00:00 +0000"), Some(a));
+        assert_eq!(
+            parse_imap_internal(" 2-Nov-2026 02:00:00 +0200"),
+            Some(a - Duration::from_secs(10 * 86_400))
+        );
     }
 }

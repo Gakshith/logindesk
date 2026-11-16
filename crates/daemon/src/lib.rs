@@ -55,7 +55,10 @@ pub fn default_deps(cfg: &Config) -> Deps {
     Deps {
         approver: system_approver(),
         launcher: Box::new(browser::ChromeLauncher),
-        mail: Box::new(mailcfg::FileMail(cfg.data_dir.clone())),
+        mail: Box::new(mailcfg::FileMail(
+            cfg.data_dir.clone(),
+            mailcfg::MailCreds::default(),
+        )),
     }
 }
 
@@ -63,7 +66,12 @@ pub fn default_deps(cfg: &Config) -> Deps {
 pub fn run(cfg: Config, vault: Vault, keys: Keys) -> std::io::Result<()> {
     harden();
     let server = Server::bind(&cfg.data_dir)?;
-    let deps = default_deps(&cfg);
+    let mut deps = default_deps(&cfg);
+    // Gmail / IMAP secrets: read once, now, while the keys are in hand.
+    deps.mail = Box::new(mailcfg::FileMail(
+        cfg.data_dir.clone(),
+        mailcfg::MailCreds::from_vault(&vault, &keys),
+    ));
     let broker = Arc::new(Broker::new(cfg, deps, vault, keys)?);
     eprintln!(
         "logindesk daemon: listening on {} (vault unlocked; Ctrl-C to stop)",

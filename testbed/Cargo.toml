@@ -30,3 +30,4 @@ logindesk-approver = { path = "../crates/approver" }
 logindesk-core = { path = "../crates/core" }
 logindesk-mail = { path = "../crates/mail" }
 logindesk-policy = { path = "../crates/policy" }
+url.workspace = true
