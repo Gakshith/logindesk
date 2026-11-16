@@ -6,7 +6,15 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
-use crate::{EMAIL_FIELDS, ExecError, MapFail, NAME_FIELDS, NEW_PW, OTP_FIELD, Session, pure};
+use std::collections::HashMap;
+
+use logindesk_core::SecretString;
+
+use crate::pure::FieldKind;
+use crate::{
+    EMAIL_FIELDS, ExecError, MapFail, NAME_FIELDS, NEW_PW, OTP_FIELD, SUBMIT_LOAD, SecretField,
+    Session, pure,
+};
 
 /// How long one look for fields may wait (SPAs build forms after `load`).
 pub(crate) const FIELD_WAIT: Duration = Duration::from_secs(10);
@@ -511,5 +519,213 @@ impl Session {
                 })
             }
         }
+    }
+}
+
+/// A field the agent named by its snapshot ref, resolved and fenced.
+#[derive(Debug)]
+pub(crate) struct AgentField {
+    /// `nodeId` in the current document.
+    node: Value,
+    /// `DOM.describeNode` result (`nodeName`, `attributes`).
+    desc: Value,
+    kind: FieldKind,
+}
+
+/// Most fields a snapshot classifies (each costs one `DOM.describeNode`).
+const MAX_KINDS: usize = 400;
+
+impl Session {
+    /// Field kinds for a snapshot, by backend id, within `budget`. Fields not reached
+    /// in time get no kind (their line shows only filled/empty, never a value).
+    pub(crate) fn field_kinds(
+        &mut self,
+        tree: &Value,
+        budget: Duration,
+    ) -> HashMap<u64, FieldKind> {
+        let deadline = Instant::now() + budget;
+        let mut out = HashMap::new();
+        for id in pure::field_ids(tree).into_iter().take(MAX_KINDS) {
+            if Instant::now() >= deadline {
+                break;
+            }
+            if let Ok(d) = self
+                .cdp
+                .call("DOM.describeNode", json!({"backendNodeId": id}))
+            {
+                out.insert(id, pure::field_kind(&d["node"]));
+            }
+        }
+        out
+    }
+
+    /// Resolve a snapshot ref, and fence the page and the field's form action.
+    fn agent_field(&mut self, site: &str, node_ref: u64) -> Result<AgentField, ExecError> {
+        self.fence(site, None)?;
+        let root = self.root()?;
+        let pushed = self
+            .cdp
+            .call(
+                "DOM.pushNodesByBackendIdsToFrontend",
+                json!({"backendNodeIds": [node_ref]}),
+            )
+            .map_err(|_| ExecError::Mapping(MapFail::NotVisible))?;
+        let node = pushed["nodeIds"][0].clone();
+        if node.as_u64().is_none_or(|n| n == 0) {
+            return Err(ExecError::Mapping(MapFail::NotVisible));
+        }
+        let d = self.cdp.call("DOM.describeNode", json!({"nodeId": node}))?;
+        let desc = d["node"].clone();
+        let form = self.form_of_field(&root, &node, &desc)?;
+        self.fence(site, form.as_ref())?;
+        Ok(AgentField {
+            kind: pure::field_kind(&desc),
+            node,
+            desc,
+        })
+    }
+
+    /// The form a field submits: its `form="id"` attribute, else the enclosing form.
+    fn form_of_field(
+        &mut self,
+        root: &Value,
+        node: &Value,
+        desc: &Value,
+    ) -> Result<Option<Value>, ExecError> {
+        if let Some(id) = pure::attr(desc, "form") {
+            let id = id.replace('\\', "\\\\").replace('"', "\\\"");
+            if let Some(f) = self.query(root, &format!("form[id=\"{id}\"]"))? {
+                return Ok(Some(f));
+            }
+        }
+        for f in self.query_all(root, "form")? {
+            if self
+                .query_all(&f, "input, textarea, select, [contenteditable]")?
+                .contains(node)
+            {
+                return Ok(Some(f));
+            }
+        }
+        Ok(None)
+    }
+
+    /// `type_text`: agent text into a non-secret field; a select picks an option.
+    pub(crate) fn agent_type(
+        &mut self,
+        site: &str,
+        node_ref: u64,
+        text: &str,
+    ) -> Result<(), ExecError> {
+        self.retry_on_stale(|s| {
+            let f = s.agent_field(site, node_ref)?;
+            match f.kind {
+                FieldKind::Password | FieldKind::Code | FieldKind::Other => Err(ExecError::Refused),
+                FieldKind::Select => s.choose_option(&f, text),
+                FieldKind::TextInput | FieldKind::TextArea | FieldKind::Email => {
+                    if !s.visible(&f.node) {
+                        return Err(ExecError::Mapping(MapFail::NotVisible));
+                    }
+                    s.fill(&f.node, text, false)
+                }
+            }
+        })
+    }
+
+    /// `fill_at`: a secret into the field this ref names, if the field suits it.
+    pub(crate) fn agent_fill(
+        &mut self,
+        site: &str,
+        node_ref: u64,
+        field: SecretField,
+        value: &SecretString,
+    ) -> Result<(), ExecError> {
+        self.retry_on_stale(|s| {
+            let f = s.agent_field(site, node_ref)?;
+            let ty = pure::plain_input_type(&f.desc);
+            let ty = ty.as_deref();
+            let suits = match field {
+                SecretField::Password => f.kind == FieldKind::Password,
+                SecretField::Code => {
+                    f.kind == FieldKind::Code
+                        || (f.kind == FieldKind::TextInput
+                            && matches!(ty, Some("text" | "number" | "tel" | "")))
+                }
+                SecretField::Email => {
+                    f.kind == FieldKind::Email
+                        || (f.kind == FieldKind::TextInput && matches!(ty, Some("text" | "")))
+                }
+            };
+            if !suits {
+                return Err(ExecError::Refused);
+            }
+            if !s.visible(&f.node) {
+                return Err(ExecError::Mapping(MapFail::NotVisible));
+            }
+            s.fill(&f.node, value.expose(), true)
+        })
+    }
+
+    /// `press_enter_at`: Enter in the field (submits its form, which is fenced), settle.
+    pub(crate) fn agent_enter(&mut self, site: &str, node_ref: u64) -> Result<(), ExecError> {
+        let f = self.retry_on_stale(|s| s.agent_field(site, node_ref))?;
+        self.press_enter(&f.node)?;
+        self.settle(SUBMIT_LOAD)
+    }
+
+    /// Pick the `<select>` option whose label or value matches `want` (case-insensitive)
+    /// by typing its label (the browser's own type-to-select, so the page sees real
+    /// input/change events), then check the select shows it.
+    fn choose_option(&mut self, f: &AgentField, want: &str) -> Result<(), ExecError> {
+        let want = want.trim();
+        let mut target = None;
+        for o in self.query_all(&f.node, "option")? {
+            let d = self
+                .cdp
+                .call("DOM.describeNode", json!({"nodeId": o, "depth": 1}))?;
+            let (label, value) = pure::option_label_value(&d["node"]);
+            let disabled = pure::attr(&d["node"], "disabled").is_some();
+            if !disabled && (label.eq_ignore_ascii_case(want) || value.eq_ignore_ascii_case(want)) {
+                target = Some(label);
+                break;
+            }
+        }
+        let label = target.ok_or(ExecError::Refused)?;
+        if self.selected_label(f)?.eq_ignore_ascii_case(&label) {
+            return Ok(());
+        }
+        // Let the previous type-to-select buffer expire, or this pick would extend it.
+        if let Some(t) = self.typeahead_at {
+            let gap = Duration::from_millis(1100);
+            if let Some(left) = gap.checked_sub(t.elapsed()) {
+                std::thread::sleep(left);
+            }
+        }
+        self.cdp.call("DOM.focus", json!({"nodeId": f.node}))?;
+        self.typeahead_at = Some(Instant::now());
+        for c in label.chars() {
+            self.cdp.call(
+                "Input.dispatchKeyEvent",
+                json!({"type": "char", "text": c.to_string()}),
+            )?;
+        }
+        self.typeahead_at = Some(Instant::now());
+        if self.selected_label(f)?.eq_ignore_ascii_case(&label) {
+            Ok(())
+        } else {
+            Err(ExecError::Browser("select did not take the option"))
+        }
+    }
+
+    /// The label a `<select>` shows now (its AX value).
+    fn selected_label(&mut self, f: &AgentField) -> Result<String, ExecError> {
+        let t = self.cdp.call(
+            "Accessibility.getPartialAXTree",
+            json!({"nodeId": f.node, "fetchRelatives": false}),
+        )?;
+        Ok(t["nodes"][0]["value"]["value"]
+            .as_str()
+            .unwrap_or("")
+            .trim()
+            .to_string())
     }
 }

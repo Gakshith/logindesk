@@ -156,6 +156,9 @@ pub struct Session {
     cdp: cdp::Cdp,
     child: std::process::Child,
     target: String,
+    /// When a `<select>` was last typed into (the browser's type-to-select buffer
+    /// lasts about a second; a new pick must not continue the old one).
+    typeahead_at: Option<Instant>,
 }
 
 impl fmt::Debug for Session {
@@ -269,6 +272,7 @@ impl Session {
             cdp: cdp::Cdp::new(tx, rx),
             child,
             target: String::new(),
+            typeahead_at: None,
         };
         s.target = s.find_page_target()?;
         let attached = s.cdp.call(
@@ -352,12 +356,14 @@ impl Session {
 
     /// Masked accessibility snapshot (limit `SNAPSHOT_MAX`).
     pub fn snapshot(&mut self) -> Result<Snapshot, ExecError> {
+        let t0 = Instant::now();
         let info = self.target_info()?;
         let tree = self.ax_tree()?;
+        let kinds = self.field_kinds(&tree, SNAPSHOT_MAX.saturating_sub(t0.elapsed()));
         Ok(Snapshot {
             url: info["url"].as_str().unwrap_or("").to_string(),
             title: info["title"].as_str().unwrap_or("").to_string(),
-            lines: pure::ax_lines(&tree),
+            lines: pure::ax_lines_kinds(&tree, &kinds),
         })
     }
 
@@ -698,8 +704,7 @@ impl Session {
     /// one-time-code fields and anything that is not a text input, textarea, select
     /// or contenteditable (`Refused`). Never presses Enter.
     pub fn type_text(&mut self, site: &str, node_ref: u64, text: &str) -> Result<(), ExecError> {
-        let _ = (site, node_ref, text);
-        Err(ExecError::Browser("type_text: not built yet"))
+        self.agent_type(site, node_ref, text)
     }
 
     /// Fill a secret into the field with this snapshot ref. The field must suit
@@ -712,15 +717,13 @@ impl Session {
         field: SecretField,
         value: &SecretString,
     ) -> Result<(), ExecError> {
-        let _ = (site, node_ref, field, value);
-        Err(ExecError::Browser("fill_at: not built yet"))
+        self.agent_fill(site, node_ref, field, value)
     }
 
     /// Press Enter in the field with this snapshot ref (submits its form), then wait
     /// for any navigation. Checks the page is on `site`.
     pub fn press_enter_at(&mut self, site: &str, node_ref: u64) -> Result<(), ExecError> {
-        let _ = (site, node_ref);
-        Err(ExecError::Browser("press_enter_at: not built yet"))
+        self.agent_enter(site, node_ref)
     }
 
     /// Close the browser.

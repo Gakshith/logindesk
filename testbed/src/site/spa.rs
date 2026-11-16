@@ -7,6 +7,10 @@
 //!   (`?evil=1`: the password page posts to another origin).
 //! - `/signup-late`: a signup form built by JS 2 s after `load`, with a new-password,
 //!   a confirmation and an off-screen honeypot password field.
+//! - `/signup-wild`: an "unpredictable" signup the agent drives field by field: first
+//!   name, phone, a country select, email, password + confirm, a terms checkbox, then
+//!   a code page (`?evil=1`: the form posts to another origin). The reply echoes the
+//!   non-secret fields and only facts about the secret ones (lengths, a match flag).
 
 use std::collections::HashMap;
 
@@ -24,6 +28,8 @@ pub(super) fn routes(r: Router<Shared>) -> Router<Shared> {
         .route("/login-js", get(login_js))
         .route("/login-two-step", get(two_step_page).post(two_step_email))
         .route("/signup-late", get(signup_late))
+        .route("/signup-wild", get(wild_page).post(wild_submit))
+        .route("/signup-wild/code", axum::routing::post(wild_code))
 }
 
 /// JS string literal for `html` (inserted with innerHTML).
@@ -139,5 +145,76 @@ async fn signup_late() -> Html<String> {
 <script>setTimeout(function () {{ document.getElementById('app').innerHTML = {}; }}, 2000);</script>"#,
             js_str(form)
         ),
+    ))
+}
+
+async fn wild_page(
+    State(site): State<Shared>,
+    Query(q): Query<HashMap<String, String>>,
+) -> Html<String> {
+    let action = if field(&q, "evil") == "1" {
+        format!("{}/collect?src=signup-wild", site.other_base())
+    } else {
+        "/signup-wild".to_string()
+    };
+    Html(page(
+        "Join Example",
+        &format!(
+            r#"<form method="post" action="{a}">
+  <label for="fn">First name</label> <input id="fn" name="first" autocomplete="given-name">
+  <label for="ph">Phone</label> <input id="ph" name="phone" type="tel">
+  <label for="country">Country</label> <select id="country" name="country">
+    <option value="">Choose…</option><option value="in">India</option>
+    <option value="us">United States</option><option value="de">Germany</option>
+  </select>
+  <label for="em">Email</label> <input id="em" name="email" type="email">
+  <label for="pw">Password</label> <input id="pw" name="password" type="password" autocomplete="new-password">
+  <label for="pw2">Confirm password</label> <input id="pw2" name="confirm" type="password" autocomplete="new-password">
+  <label><input type="checkbox" name="terms" required> I agree to the terms</label>
+  <input type="hidden" name="csrf" value="t0k3n">
+  <button type="submit">Create account</button>
+</form>"#,
+            a = esc(&action)
+        ),
+    ))
+}
+
+async fn wild_submit(Form(f): Form<HashMap<String, String>>) -> Html<String> {
+    let (pw, confirm) = (field(&f, "password"), field(&f, "confirm"));
+    let summary = format!(
+        "first={}; phone={}; country={}; email={}; terms={}; password_len={}; passwords_match={}",
+        field(&f, "first"),
+        field(&f, "phone"),
+        field(&f, "country"),
+        field(&f, "email"),
+        field(&f, "terms"),
+        pw.chars().count(),
+        if !pw.is_empty() && pw == confirm {
+            "yes"
+        } else {
+            "no"
+        },
+    );
+    Html(page(
+        "Check your email",
+        &format!(
+            r#"<p role="status">{}</p>
+<form method="post" action="/signup-wild/code">
+  <label for="vc">Verification code</label> <input id="vc" name="code" inputmode="numeric" autocomplete="one-time-code">
+  <button type="submit">Verify</button>
+</form>"#,
+            esc(&summary)
+        ),
+    ))
+}
+
+async fn wild_code(Form(f): Form<HashMap<String, String>>) -> Html<String> {
+    let n = field(&f, "code")
+        .chars()
+        .filter(char::is_ascii_digit)
+        .count();
+    Html(page(
+        "Welcome",
+        &format!("<p role=\"status\">Code received: {n} digits</p>"),
     ))
 }

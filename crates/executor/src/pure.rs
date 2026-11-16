@@ -32,6 +32,154 @@ const SHOWN: &[&str] = &[
 /// beneath them is shown (Chrome puts the typed text in child StaticText nodes).
 const FIELDS: &[&str] = &["textbox", "searchbox", "combobox", "spinbutton"];
 
+/// What kind of field a DOM element is, judged from its tag and attributes only.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum FieldKind {
+    /// `input[type=password]`.
+    Password,
+    /// A one-time-code input (`autocomplete=one-time-code`, or named like one).
+    Code,
+    /// `input[type=email]`, or an input whose autocomplete says email.
+    Email,
+    /// A plain text-like input (`text`, `tel`, `number`, `search`, `url`, no type...).
+    TextInput,
+    /// `textarea` or a contenteditable element.
+    TextArea,
+    /// `<select>`.
+    Select,
+    /// Anything that takes no typed text: hidden, file, submit, checkbox, a div...
+    Other,
+}
+
+impl FieldKind {
+    /// The label a snapshot shows for it, if any.
+    pub(crate) fn label(self) -> Option<&'static str> {
+        match self {
+            Self::Password => Some("password"),
+            Self::Code => Some("code"),
+            Self::Email => Some("email"),
+            Self::TextInput | Self::TextArea => Some("text"),
+            Self::Select | Self::Other => None,
+        }
+    }
+}
+
+/// Value of `name` in a `DOM.describeNode` node's flat `attributes` list.
+fn node_attr<'a>(node: &'a Value, name: &str) -> Option<&'a str> {
+    attr(node, name)
+}
+
+/// Same rules as the executor's `OTP_FIELD` selector, on attributes.
+fn code_like(node: &Value) -> bool {
+    let lower = |k: &str| node_attr(node, k).map(str::to_ascii_lowercase);
+    let ac = lower("autocomplete").unwrap_or_default();
+    if ac.split_whitespace().any(|t| t == "one-time-code") {
+        return true;
+    }
+    let (name, id) = (
+        lower("name").unwrap_or_default(),
+        lower("id").unwrap_or_default(),
+    );
+    name.contains("otp")
+        || id.contains("otp")
+        || name == "code"
+        || id == "code"
+        || name.contains("one-time")
+        || name.contains("onetime")
+        || name.contains("verification")
+}
+
+/// The field kind of a `DOM.describeNode` result's `node` (`nodeName` + `attributes`).
+pub(crate) fn field_kind(node: &Value) -> FieldKind {
+    let tag = node["nodeName"].as_str().unwrap_or("").to_ascii_uppercase();
+    let editable =
+        node_attr(node, "contenteditable").is_some_and(|v| !v.eq_ignore_ascii_case("false"));
+    match tag.as_str() {
+        "INPUT" => {
+            let ty = node_attr(node, "type")
+                .unwrap_or("text")
+                .trim()
+                .to_ascii_lowercase();
+            match ty.as_str() {
+                "password" => FieldKind::Password,
+                "hidden" | "file" | "submit" | "button" | "image" | "reset" | "checkbox"
+                | "radio" | "range" | "color" => FieldKind::Other,
+                _ if code_like(node) => FieldKind::Code,
+                "email" => FieldKind::Email,
+                _ if node_attr(node, "autocomplete").is_some_and(|a| {
+                    a.to_ascii_lowercase()
+                        .split_whitespace()
+                        .any(|t| t == "email")
+                }) =>
+                {
+                    FieldKind::Email
+                }
+                "" | "text" | "tel" | "number" | "search" | "url" | "date" | "month" | "week"
+                | "time" | "datetime-local" => FieldKind::TextInput,
+                _ => FieldKind::Other,
+            }
+        }
+        "TEXTAREA" => FieldKind::TextArea,
+        "SELECT" => FieldKind::Select,
+        _ if editable => FieldKind::TextArea,
+        _ => FieldKind::Other,
+    }
+}
+
+/// Is this `input` type one an emailed code may go into (besides a code-like field)?
+pub(crate) fn plain_input_type(node: &Value) -> Option<String> {
+    if !node["nodeName"]
+        .as_str()
+        .is_some_and(|t| t.eq_ignore_ascii_case("input"))
+    {
+        return None;
+    }
+    Some(
+        node_attr(node, "type")
+            .unwrap_or("text")
+            .trim()
+            .to_ascii_lowercase(),
+    )
+}
+
+/// Backend ids of the field nodes (textbox, combobox...) in an AX tree, for kinds.
+pub(crate) fn field_ids(tree: &Value) -> Vec<u64> {
+    tree["nodes"]
+        .as_array()
+        .map(|a| {
+            a.iter()
+                .filter(|n| n["ignored"].as_bool() != Some(true) && FIELDS.contains(&role(n)))
+                .filter_map(|n| n["backendDOMNodeId"].as_u64())
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// An `<option>` from `DOM.describeNode` (depth 1): its label (the `label`
+/// attribute, else its text) and its value (the `value` attribute, else the label).
+pub(crate) fn option_label_value(node: &Value) -> (String, String) {
+    let text: String = node["children"]
+        .as_array()
+        .map(|k| {
+            k.iter()
+                .filter_map(|c| c["nodeValue"].as_str())
+                .collect::<Vec<_>>()
+                .join("")
+        })
+        .unwrap_or_default();
+    let label = attr(node, "label")
+        .map(str::to_string)
+        .unwrap_or(text)
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let value = attr(node, "value").map_or_else(|| label.clone(), str::to_string);
+    (label, value)
+}
+
+/// Most option labels a snapshot lists for one `<select>`.
+const MAX_OPTIONS: usize = 25;
+
 /// Most lines one snapshot returns.
 pub(crate) const MAX_LINES: usize = 2000;
 /// Longest name shown, in chars.
@@ -51,6 +199,14 @@ fn name(n: &Value) -> &str {
 /// Chrome puts under a field) reaches the output. Nodes not reachable from the root
 /// are dropped.
 pub(crate) fn ax_lines(tree: &Value) -> Vec<String> {
+    ax_lines_kinds(tree, &HashMap::new())
+}
+
+/// [`ax_lines`] with each field's kind (by backend node id): text fields show
+/// `(password, empty)`, `(code, filled)`, `(email, ...)`, `(text, ...)`; a `<select>`
+/// shows its chosen option and the options it offers. A field with no known kind
+/// shows only `(filled)` / `(empty)`. Text-field values are never shown.
+pub(crate) fn ax_lines_kinds(tree: &Value, kinds: &HashMap<u64, FieldKind>) -> Vec<String> {
     let Some(nodes) = tree["nodes"].as_array() else {
         return Vec::new();
     };
@@ -92,7 +248,30 @@ pub(crate) fn ax_lines(tree: &Value) -> Vec<String> {
         let mut line = format!("[{id}] {r} \"{nm}\"");
         if field {
             let filled = n["value"]["value"].as_str().is_some_and(|v| !v.is_empty());
-            line.push_str(if filled { " (filled)" } else { " (empty)" });
+            let state = if filled { "filled" } else { "empty" };
+            match kinds.get(&id) {
+                Some(FieldKind::Select) => {
+                    // A select's value is the label of a choice, not typed text.
+                    let chosen = clean(n["value"]["value"].as_str().unwrap_or(""));
+                    let opts = select_options(n, &by_id);
+                    line.push_str(&format!(" (select: \"{chosen}\""));
+                    if !opts.is_empty() {
+                        line.push_str(&format!("; options: {}", opts.join(" | ")));
+                    }
+                    line.push(')');
+                }
+                Some(k) => match k.label() {
+                    Some(l) => line.push_str(&format!(" ({l}, {state})")),
+                    None => line.push_str(&format!(" ({state})")),
+                },
+                None => line.push_str(&format!(" ({state})")),
+            }
+        } else if matches!(r, "checkbox" | "radio" | "switch") {
+            match checked(n) {
+                Some(true) => line.push_str(" (checked)"),
+                Some(false) => line.push_str(" (unchecked)"),
+                None => {}
+            }
         }
         out.push(line);
         last_name = nm;
@@ -101,6 +280,43 @@ pub(crate) fn ax_lines(tree: &Value) -> Vec<String> {
         }
     }
     out
+}
+
+/// Labels of a `<select>`'s options (its AX descendants), quoted, at most `MAX_OPTIONS`.
+fn select_options(n: &Value, by_id: &HashMap<&str, &Value>) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack: Vec<&Value> = vec![n];
+    let mut hops = 0;
+    while let Some(cur) = stack.pop() {
+        hops += 1;
+        if hops > 2000 || out.len() >= MAX_OPTIONS {
+            break;
+        }
+        if !std::ptr::eq(cur, n) && matches!(role(cur), "MenuListOption" | "option") {
+            out.push(format!("\"{}\"", clean(name(cur))));
+            continue;
+        }
+        if let Some(kids) = cur["childIds"].as_array() {
+            stack.extend(
+                kids.iter()
+                    .rev()
+                    .filter_map(Value::as_str)
+                    .filter_map(|k| by_id.get(k).copied()),
+            );
+        }
+    }
+    out
+}
+
+/// A checkbox's state from its AX `checked` property.
+fn checked(n: &Value) -> Option<bool> {
+    n["properties"].as_array()?.iter().find_map(|p| {
+        (p["name"] == "checked").then(|| match &p["value"]["value"] {
+            Value::Bool(b) => *b,
+            Value::String(s) => s == "true" || s == "mixed",
+            _ => false,
+        })
+    })
 }
 
 /// One line, quotes escaped, at most `MAX_NAME` chars.
@@ -342,6 +558,91 @@ mod tests {
         assert!(!action_on_site(&look, Some("/collect"), site));
         let ip = Url::parse("http://127.0.0.1:4000/login").unwrap();
         assert!(!on_site(&ip, site));
+    }
+
+    fn dn(tag: &str, attrs: &[&str]) -> Value {
+        json!({"nodeName": tag, "attributes": attrs})
+    }
+
+    #[test]
+    fn field_kinds() {
+        use FieldKind::*;
+        assert_eq!(field_kind(&dn("INPUT", &["type", "password"])), Password);
+        assert_eq!(field_kind(&dn("INPUT", &["type", "PASSWORD"])), Password);
+        assert_eq!(
+            field_kind(&dn("INPUT", &["autocomplete", "one-time-code"])),
+            Code
+        );
+        assert_eq!(
+            field_kind(&dn("INPUT", &["name", "otp_1", "type", "tel"])),
+            Code
+        );
+        assert_eq!(field_kind(&dn("INPUT", &["id", "code"])), Code);
+        // A password field named "code" is still a password field.
+        assert_eq!(
+            field_kind(&dn("INPUT", &["type", "password", "name", "code"])),
+            Password
+        );
+        assert_eq!(field_kind(&dn("INPUT", &["type", "email"])), Email);
+        assert_eq!(
+            field_kind(&dn("INPUT", &["autocomplete", "username email"])),
+            Email
+        );
+        assert_eq!(field_kind(&dn("INPUT", &[])), TextInput);
+        assert_eq!(field_kind(&dn("INPUT", &["type", "tel"])), TextInput);
+        assert_eq!(field_kind(&dn("INPUT", &["name", "postcode"])), TextInput);
+        for t in ["hidden", "file", "submit", "checkbox", "button"] {
+            assert_eq!(field_kind(&dn("INPUT", &["type", t])), Other, "{t}");
+        }
+        assert_eq!(field_kind(&dn("TEXTAREA", &[])), TextArea);
+        assert_eq!(field_kind(&dn("SELECT", &[])), Select);
+        assert_eq!(
+            field_kind(&dn("DIV", &["contenteditable", "true"])),
+            TextArea
+        );
+        assert_eq!(field_kind(&dn("DIV", &["contenteditable", "false"])), Other);
+        assert_eq!(field_kind(&dn("DIV", &[])), Other);
+    }
+
+    #[test]
+    fn snapshot_kinds_and_selects() {
+        let t = json!({"nodes": [
+            {"nodeId": "1", "childIds": ["2", "3", "4", "5", "8"], "role": {"value": "RootWebArea"}},
+            {"nodeId": "2", "parentId": "1", "role": {"value": "textbox"}, "name": {"value": "Password"},
+             "value": {"value": "fixture-pw-123"}, "backendDOMNodeId": 12},
+            {"nodeId": "3", "parentId": "1", "role": {"value": "textbox"}, "name": {"value": "Code"}, "backendDOMNodeId": 14},
+            {"nodeId": "4", "parentId": "1", "role": {"value": "textbox"}, "name": {"value": "First name"},
+             "value": {"value": "Ada"}, "backendDOMNodeId": 15},
+            {"nodeId": "5", "parentId": "1", "childIds": ["6"], "role": {"value": "combobox"}, "name": {"value": "Country"},
+             "value": {"value": "Germany"}, "backendDOMNodeId": 16},
+            {"nodeId": "6", "parentId": "5", "childIds": ["7", "9"], "role": {"value": "MenuListPopup"}},
+            {"nodeId": "7", "parentId": "6", "role": {"value": "MenuListOption"}, "name": {"value": "India"}},
+            {"nodeId": "9", "parentId": "6", "role": {"value": "MenuListOption"}, "name": {"value": "Germany"}},
+            {"nodeId": "8", "parentId": "1", "role": {"value": "checkbox"}, "name": {"value": "I agree"},
+             "properties": [{"name": "checked", "value": {"type": "tristate", "value": "true"}}], "backendDOMNodeId": 17}
+        ]});
+        let kinds: HashMap<u64, FieldKind> = [
+            (12, FieldKind::Password),
+            (14, FieldKind::Code),
+            (15, FieldKind::TextInput),
+            (16, FieldKind::Select),
+        ]
+        .into();
+        let lines = ax_lines_kinds(&t, &kinds);
+        assert_eq!(
+            lines,
+            vec![
+                "[12] textbox \"Password\" (password, filled)",
+                "[14] textbox \"Code\" (code, empty)",
+                "[15] textbox \"First name\" (text, filled)",
+                "[16] combobox \"Country\" (select: \"Germany\"; options: \"India\" | \"Germany\")",
+                "[17] checkbox \"I agree\" (checked)",
+            ]
+        );
+        let all = lines.join("\n");
+        assert!(!all.contains("fixture-pw-123") && !all.contains("Ada"));
+        // Without kinds (e.g. out of time) a select is just filled/empty: no label shown.
+        assert!(ax_lines(&t).contains(&"[16] combobox \"Country\" (filled)".to_string()));
     }
 
     #[test]
