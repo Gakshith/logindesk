@@ -43,6 +43,23 @@ pub struct SessionArgs {
     pub session_id: String,
 }
 
+/// `signup` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct SignupArgs {
+    /// Site to create an account on: a host like `example.com` or a URL.
+    pub site: String,
+    /// The signup page URL, when it is not `https://<site>/signup`. Must be on the same site.
+    #[serde(default)]
+    pub url: Option<String>,
+}
+
+/// `wait` arguments.
+#[derive(Debug, Deserialize, JsonSchema)]
+pub struct WaitArgs {
+    /// The handle from an `awaiting_approval` reply.
+    pub handle: String,
+}
+
 /// `navigate` arguments.
 #[derive(Debug, Deserialize, JsonSchema)]
 pub struct NavigateArgs {
@@ -102,6 +119,35 @@ impl Logindesk {
             op["account"] = acct.into();
         }
         self.send(&peer, op).await
+    }
+
+    /// Create an account on a website with the user's identity (email, name) and a password
+    /// the broker generates and stores. Secrets are filled by the broker and never returned;
+    /// the emailed verification code or link is handled by the broker too. Returns JSON:
+    /// {"status":"created","account_id":...,"session_id":...,"data":{"email_used":...}} on
+    /// success; or denied, awaiting_approval (call wait), email_not_connected, needs_user
+    /// (reason) or failed (reason). Refused for banks, government, health, payment and
+    /// email-provider sites.
+    #[tool]
+    async fn signup(
+        &self,
+        Parameters(a): Parameters<SignupArgs>,
+        peer: Peer<RoleServer>,
+    ) -> String {
+        let mut op = json!({"op": "signup", "site": a.site});
+        if let Some(u) = a.url {
+            op["url"] = u.into();
+        }
+        self.send(&peer, op).await
+    }
+
+    /// Wait for a login or signup that returned awaiting_approval (the user has not answered
+    /// the Touch ID prompt yet). Returns the flow's final status, or awaiting_approval again
+    /// if the user still has not answered. Secrets are filled by the broker and never returned.
+    #[tool]
+    async fn wait(&self, Parameters(a): Parameters<WaitArgs>, peer: Peer<RoleServer>) -> String {
+        self.send(&peer, json!({"op": "wait", "handle": a.handle}))
+            .await
     }
 
     /// List the stored accounts the broker can log in with: account_id, site and username

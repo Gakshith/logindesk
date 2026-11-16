@@ -177,6 +177,47 @@ fn grants_and_mail_config() {
         "{g}"
     );
 
+    let signup_grant = [
+        "grant",
+        "add",
+        "example.com",
+        "--tier",
+        "auto",
+        "--action",
+        "signup",
+    ];
+    assert!(run(&v, &signup_grant, &[]).ok);
+    let o = run(&v, &["grant", "list"], &[]);
+    assert!(o.stdout.contains("signup  auto"), "{}", o.stdout);
+    let g = std::fs::read_to_string(t.0.join("grants.json")).unwrap();
+    assert!(g.contains("\"signup\""), "{g}");
+    assert!(
+        run(
+            &v,
+            &["grant", "remove", "example.com", "--action", "signup"],
+            &[]
+        )
+        .ok
+    );
+
+    assert!(!run(&v, &["identity", "show"], &[]).ok);
+    assert!(!run(&v, &["identity", "set", "--email", "not-an-email"], &[]).ok);
+    let set = [
+        "identity",
+        "set",
+        "--email",
+        "you@mail.test",
+        "--name",
+        "Ann",
+    ];
+    assert!(run(&v, &set, &[]).ok);
+    let o = run(&v, &["identity", "show"], &[]);
+    assert!(
+        o.ok && o.stdout.contains("you@mail.test") && o.stdout.contains("Ann"),
+        "{}",
+        o.stdout
+    );
+
     assert!(
         run(
             &v,
@@ -311,7 +352,9 @@ fn daemon_serves_cli_and_mcp_and_never_leaks() {
             "list_accounts",
             "login",
             "navigate",
-            "snapshot"
+            "signup",
+            "snapshot",
+            "wait"
         ]
     );
     for t in tools["result"]["tools"].as_array().unwrap() {
@@ -331,6 +374,11 @@ fn daemon_serves_cli_and_mcp_and_never_leaks() {
     let r = m.call(5, "snapshot", json!({"session_id":"0".repeat(32)}));
     assert_eq!(r["reason"], "session_not_found");
     let r = m.call(6, "click", json!({"session_id":"x","ref":3}));
+    assert_eq!(r["reason"], "session_not_found");
+    // Signup on a blocklisted site is refused before any browser; wait on a bad handle.
+    let r = m.call(7, "signup", json!({"site":"paypal.com"}));
+    assert_eq!(r["reason"], "grant_denied");
+    let r = m.call(8, "wait", json!({"handle":"0".repeat(32)}));
     assert_eq!(r["reason"], "session_not_found");
     for l in &m.raw {
         assert!(!l.contains(SECRET), "MCP output leaked the secret: {l}");
