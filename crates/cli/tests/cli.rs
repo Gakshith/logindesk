@@ -211,6 +211,111 @@ fn import_csv_then_list() {
     assert_no_leak(&o, &["CANARY-imp"]);
 }
 
+fn login_rows(t: &Tmp) -> usize {
+    let o = run(&t.vault(), &["vault", "list"], &[PW]);
+    o.stdout.lines().filter(|l| l.contains(" login ")).count()
+}
+
+#[test]
+fn reimport_skips_duplicates_and_updates_changed_passwords() {
+    let t = Tmp::new("reimport");
+    setup(&t);
+    let csv = t.0.join("in.csv");
+    let import = |t: &Tmp| {
+        run(
+            &t.vault(),
+            &["vault", "import", "--csv", csv.to_str().unwrap()],
+            &[PW],
+        )
+    };
+    // The CSV repeats amazon.com/ann (same password) and lists it under a URL too.
+    std::fs::write(
+        &csv,
+        "name,url,username,password,note\n\
+         A,https://www.amazon.com/ap/signin,ann,CANARY-re-a,\n\
+         A2,amazon.com,ann,CANARY-re-a,\n\
+         B,b.test,bo,CANARY-re-b,\n",
+    )
+    .unwrap();
+    let o = import(&t);
+    assert!(o.ok, "{}", o.stderr);
+    assert!(
+        o.stderr.contains("Imported 2, updated 0, skipped 1 duplicate(s)."),
+        "{}",
+        o.stderr
+    );
+    assert_eq!(login_rows(&t), 2);
+
+    // The same file again: nothing new.
+    let o = import(&t);
+    assert!(
+        o.stderr.contains("Imported 0, updated 0, skipped 3 duplicate(s)."),
+        "{}",
+        o.stderr
+    );
+    assert_eq!(login_rows(&t), 2);
+
+    // A changed password updates the stored record instead of adding one.
+    std::fs::write(
+        &csv,
+        "name,url,username,password,note\nB,b.test,bo,CANARY-re-b2,\nC,c.test,cy,CANARY-re-c,\n",
+    )
+    .unwrap();
+    let o = import(&t);
+    assert!(
+        o.stderr.contains("Imported 1, updated 1, skipped 0 duplicate(s)."),
+        "{}",
+        o.stderr
+    );
+    assert_eq!(login_rows(&t), 3);
+    assert_no_leak(&o, &["CANARY-re"]);
+    // The update really replaced the secret: an export shows the new one only.
+    let out = t.0.join("plain.csv");
+    let o = run(
+        &t.vault(),
+        &["vault", "export", "--plaintext", "--out", out.to_str().unwrap()],
+        &[PW, PW],
+    );
+    assert!(o.ok, "{}", o.stderr);
+    let plain = std::fs::read_to_string(&out).unwrap();
+    assert!(plain.contains("CANARY-re-b2") && !plain.contains("CANARY-re-b,"));
+}
+
+#[test]
+fn dedupe_keeps_the_newest_record_of_each_account() {
+    let t = Tmp::new("dedupe");
+    setup(&t);
+    let add = |site: &str, user: &str, pw: &str| {
+        let o = run(
+            &t.vault(),
+            &["vault", "add", "--site", site, "--username", user],
+            &[PW, pw],
+        );
+        assert!(o.ok, "{}", o.stderr);
+        o.stdout.trim().to_string()
+    };
+    add("amazon.com", "ann", "CANARY-dd-old");
+    std::thread::sleep(std::time::Duration::from_millis(1100)); // updated_at is in seconds
+    let newest = add("https://www.amazon.com/", "ann", "CANARY-dd-new");
+    add("amazon.com", "Ann", "CANARY-dd-other-case");
+    add("b.test", "bo", "CANARY-dd-b");
+    assert_eq!(login_rows(&t), 4);
+
+    let o = run(&t.vault(), &["vault", "dedupe"], &[PW]);
+    assert!(o.ok, "{}", o.stderr);
+    assert!(o.stderr.contains("Removed 1 duplicate(s)"), "{}", o.stderr);
+    assert_eq!(o.stdout.lines().count(), 1);
+    assert!(!o.stdout.contains(&newest), "the newest is kept: {}", o.stdout);
+    assert_no_leak(&o, &["CANARY-dd"]);
+    assert_eq!(login_rows(&t), 3);
+    let o = run(&t.vault(), &["vault", "list"], &[PW]);
+    assert!(o.stdout.contains(&newest));
+
+    // Nothing left to merge.
+    let o = run(&t.vault(), &["vault", "dedupe"], &[PW]);
+    assert!(o.stderr.contains("Removed 0 duplicate(s)"), "{}", o.stderr);
+}
+
 #[test]
 fn encrypted_export_is_default() {
     let t = Tmp::new("export");
