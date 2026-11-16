@@ -6,6 +6,7 @@
 //! which writes to a file, never to a stream.
 #![forbid(unsafe_code)]
 
+mod connect;
 mod paths;
 mod prompt;
 
@@ -80,6 +81,11 @@ enum Cmd {
     /// Where the daemon reads emailed one-time codes.
     #[command(subcommand)]
     Mail(MailCmd),
+    /// Connect a real mailbox (Gmail or IMAP) for emailed codes; secrets go into the vault.
+    #[command(subcommand)]
+    Connect(connect::ConnectCmd),
+    /// Forget the connected mailbox: delete its vault secrets and mail.json.
+    Disconnect,
     /// Log in to a site through the daemon (as client "cli") and print the reply.
     Login {
         /// Host or URL.
@@ -284,6 +290,8 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Mcp => Ok(logindesk_mcp::run(data_dir(&path))?),
         Cmd::Grant(cmd) => grant_cmd(&path, cmd),
         Cmd::Mail(cmd) => mail_cmd(&data_dir(&path), cmd),
+        Cmd::Connect(cmd) => connect::run(&path, &data_dir(&path), cmd, &mut prompt),
+        Cmd::Disconnect => connect::disconnect(&path, &data_dir(&path), &mut prompt),
         Cmd::Login { site, account } => {
             let mut op = json!({"op": "login", "site": site});
             if let Some(a) = account {
