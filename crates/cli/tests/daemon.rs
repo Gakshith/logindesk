@@ -400,3 +400,37 @@ fn daemon_serves_cli_and_mcp_and_never_leaks() {
         "vault_locked"
     );
 }
+
+/// The 2026-07-28 MCP lifecycle sends no `initialize`: `clientInfo` travels in each
+/// request's `_meta`. The agent's name must still reach the audit log.
+#[test]
+fn per_request_client_info_names_the_agent_in_the_audit() {
+    let t = Tmp::new();
+    setup_with_account(&t);
+    let v = t.vault();
+    assert!(run(&v, &["grant", "add", "example.com", "--tier", "deny"], &[]).ok);
+    let _d = start_daemon(&t);
+    let mut m = Mcp::start(&v);
+    let meta = json!({
+        "io.modelcontextprotocol/protocolVersion": "2026-07-28",
+        "io.modelcontextprotocol/clientCapabilities": {},
+        "io.modelcontextprotocol/clientInfo": {"name": "claude-code", "version": "2.1"}
+    });
+    m.send(
+        json!({"jsonrpc":"2.0","id":1,"method":"tools/call","params":{
+        "name":"login","arguments":{"site":"example.com"},"_meta": meta}}),
+    );
+    let r = m.wait_id(1);
+    let text = r["result"]["content"][0]["text"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{r}"));
+    let reply: Value = serde_json::from_str(text).unwrap();
+    assert_eq!(reply["reason"], "grant_denied");
+    drop(m);
+    let audit = std::fs::read_to_string(t.0.join("audit.jsonl")).unwrap();
+    assert!(
+        audit.contains(r#""client":"claude-code","op":"login""#),
+        "{audit}"
+    );
+    assert!(!audit.contains("unknown-mcp-client"), "{audit}");
+}

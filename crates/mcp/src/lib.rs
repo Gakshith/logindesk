@@ -134,7 +134,11 @@ impl Logindesk {
     /// on success, or a status such as denied, vault_locked, email_not_connected,
     /// needs_user (reason) or failed (reason).
     #[tool]
-    async fn login(&self, Parameters(a): Parameters<LoginArgs>, ctx: RequestContext<RoleServer>) -> String {
+    async fn login(
+        &self,
+        Parameters(a): Parameters<LoginArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
         let mut op = json!({"op": "login", "site": a.site});
         if let Some(acct) = a.account {
             op["account"] = acct.into();
@@ -166,7 +170,11 @@ impl Logindesk {
     /// the Touch ID prompt yet). Returns the flow's final status, or awaiting_approval again
     /// if the user still has not answered. Secrets are filled by the broker and never returned.
     #[tool]
-    async fn wait(&self, Parameters(a): Parameters<WaitArgs>, ctx: RequestContext<RoleServer>) -> String {
+    async fn wait(
+        &self,
+        Parameters(a): Parameters<WaitArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
         self.send(&ctx, json!({"op": "wait", "handle": a.handle}))
             .await
     }
@@ -218,7 +226,11 @@ impl Logindesk {
     /// Click the element with this ref from the latest snapshot. Secrets are filled by the
     /// broker and never returned.
     #[tool]
-    async fn click(&self, Parameters(a): Parameters<ClickArgs>, ctx: RequestContext<RoleServer>) -> String {
+    async fn click(
+        &self,
+        Parameters(a): Parameters<ClickArgs>,
+        ctx: RequestContext<RoleServer>,
+    ) -> String {
         self.send(
             &ctx,
             json!({"op": "click", "session_id": a.session_id, "ref": a.node_ref}),
@@ -242,20 +254,6 @@ impl Logindesk {
     }
 }
 
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn client_names() {
-        assert_eq!(client_name(Some("claude-code")), "claude-code");
-        assert_eq!(client_name(Some("  ")), UNKNOWN_CLIENT);
-        assert_eq!(client_name(None), UNKNOWN_CLIENT);
-        assert_eq!(client_name(Some("evil\nApprove")), "evilApprove");
-        assert_eq!(client_name(Some(&"x".repeat(200))).len(), 64);
-    }
-}
-
 /// Serve MCP on stdin/stdout until the client disconnects.
 pub fn run(data_dir: PathBuf) -> std::io::Result<()> {
     let rt = tokio::runtime::Builder::new_multi_thread()
@@ -269,4 +267,18 @@ pub fn run(data_dir: PathBuf) -> std::io::Result<()> {
         svc.waiting().await.map_err(std::io::Error::other)?;
         Ok(())
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_names() {
+        assert_eq!(client_name(Some("claude-code")), "claude-code");
+        assert_eq!(client_name(Some("  ")), UNKNOWN_CLIENT);
+        assert_eq!(client_name(None), UNKNOWN_CLIENT);
+        assert_eq!(client_name(Some("evil\nApprove")), "evilApprove");
+        assert_eq!(client_name(Some(&"x".repeat(200))).len(), 64);
+    }
 }
