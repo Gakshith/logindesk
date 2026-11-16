@@ -10,7 +10,9 @@ use axum::routing::get;
 use logindesk_approver::{Action, ApprovalRequest, ApprovalToken};
 use logindesk_core::SecretString;
 use logindesk_core::ids::RequestId;
-use logindesk_executor::{BrowserConfig, ExecError, FormKind, MapFail, PageState, Session};
+use logindesk_executor::{
+    BrowserConfig, ExecError, FormKind, MapFail, PageState, SecretField, Session, Snapshot,
+};
 use testbed::fixtures::Fixtures;
 use testbed::site::{self, MailSink, Running};
 
@@ -265,19 +267,19 @@ fn filled_form_snapshot_shows_filled_not_values() {
     assert!(
         snap.lines
             .iter()
-            .any(|l| l.contains("textbox \"Email\" (filled)")),
+            .any(|l| l.contains("textbox \"Email\" (email, filled)")),
         "{all}"
     );
     assert!(
         snap.lines
             .iter()
-            .any(|l| l.contains("\"Password\" (filled)")),
+            .any(|l| l.contains("\"Password\" (password, filled)")),
         "{all}"
     );
     assert!(
         snap.lines
             .iter()
-            .any(|l| l.contains("textbox \"Note\" (empty)")),
+            .any(|l| l.contains("textbox \"Note\" (text, empty)")),
         "{all}"
     );
 }
@@ -387,10 +389,16 @@ fn signup_rehearsal_skips_the_honeypot() {
     let snap = e.s.snapshot().expect("snapshot");
     let all = snap.lines.join("\n");
     eprintln!("signup rehearsal snapshot:\n{all}");
-    assert!(all.contains("textbox \"Email\" (filled)"), "{all}");
-    assert!(all.contains("\"Password\" (filled)"), "{all}");
-    assert!(all.contains("\"Confirm password\" (filled)"), "{all}");
-    assert!(all.contains("\"Leave this empty\" (empty)"), "{all}");
+    assert!(all.contains("textbox \"Email\" (email, filled)"), "{all}");
+    assert!(all.contains("\"Password\" (password, filled)"), "{all}");
+    assert!(
+        all.contains("\"Confirm password\" (password, filled)"),
+        "{all}"
+    );
+    assert!(
+        all.contains("\"Leave this empty\" (password, empty)"),
+        "{all}"
+    );
     assert!(!all.contains("rehearsal"), "a value leaked: {all}");
     assert!(
         e.s.current_url().expect("url").ends_with("/signup-late"),
@@ -426,4 +434,181 @@ fn page_without_a_form_says_why() {
     let r =
         e.s.fill_login(SITE, &user, &SecretString::new(pw), token(SITE));
     assert_eq!(r, Err(ExecError::Mapping(MapFail::NoForm)));
+}
+
+// ---------- agent-driven forms (contract §12): the agent types, the broker fills secrets ----------
+
+/// The ref of the first snapshot line containing `needle`.
+fn ref_of(snap: &Snapshot, needle: &str) -> u64 {
+    let l = snap
+        .lines
+        .iter()
+        .find(|l| l.contains(needle))
+        .unwrap_or_else(|| panic!("no line with {needle:?} in:\n{}", snap.lines.join("\n")));
+    l[1..l.find(']').expect("ref")].parse().expect("ref number")
+}
+
+fn secret(s: &str) -> SecretString {
+    SecretString::new(s.to_string())
+}
+
+#[test]
+fn agent_drives_an_unpredictable_signup() {
+    let Some(mut e) = env() else { return };
+    let url = format!("{}/signup-wild", e.base());
+    e.s.navigate(&url).expect("navigate");
+    let snap = e.s.snapshot().expect("snapshot");
+    let all = snap.lines.join("\n");
+    eprintln!("signup-wild snapshot:\n{all}");
+    // Kinds tell the agent which ref takes which secret.
+    assert!(
+        all.contains("textbox \"First name\" (text, empty)"),
+        "{all}"
+    );
+    assert!(all.contains("textbox \"Email\" (email, empty)"), "{all}");
+    assert!(
+        all.contains("textbox \"Password\" (password, empty)"),
+        "{all}"
+    );
+    assert!(
+        all.contains("textbox \"Confirm password\" (password, empty)"),
+        "{all}"
+    );
+    assert!(
+        all.contains("combobox \"Country\" (select: \"Choose…\"; options: \"Choose…\" | \"India\" | \"United States\" | \"Germany\")"),
+        "{all}"
+    );
+    assert!(
+        all.contains("checkbox \"I agree to the terms\" (unchecked)"),
+        "{all}"
+    );
+
+    let first = ref_of(&snap, "textbox \"First name\"");
+    let phone = ref_of(&snap, "textbox \"Phone\"");
+    let country = ref_of(&snap, "combobox \"Country\"");
+    let email = ref_of(&snap, "textbox \"Email\"");
+    let pw = ref_of(&snap, "textbox \"Password\"");
+    let pw2 = ref_of(&snap, "textbox \"Confirm password\"");
+    let terms = ref_of(&snap, "checkbox \"I agree to the terms\"");
+
+    // The agent types the non-secret fields; a select takes a label or a value.
+    e.s.type_text(SITE, first, "Ada").expect("first name");
+    e.s.type_text(SITE, phone, "5550100").expect("phone");
+    e.s.type_text(SITE, country, "united states")
+        .expect("select by label");
+    e.s.type_text(SITE, country, "de").expect("select by value");
+    assert_eq!(
+        e.s.type_text(SITE, country, "Atlantis"),
+        Err(ExecError::Refused)
+    );
+
+    // The agent can never type into a secret field, even text it made up.
+    assert_eq!(e.s.type_text(SITE, pw, "guess"), Err(ExecError::Refused));
+    assert_eq!(e.s.type_text(SITE, terms, "x"), Err(ExecError::Refused));
+
+    // The broker's secrets go only into fields of the right kind.
+    let (addr, password) = ("ada+example@example.localhost", "Wild-signup-pass-123");
+    assert_eq!(
+        e.s.fill_at(SITE, first, SecretField::Password, &secret(password)),
+        Err(ExecError::Refused)
+    );
+    assert_eq!(
+        e.s.fill_at(SITE, pw, SecretField::Email, &secret(addr)),
+        Err(ExecError::Refused)
+    );
+    assert_eq!(
+        e.s.fill_at(SITE, pw, SecretField::Code, &secret("123456")),
+        Err(ExecError::Refused)
+    );
+    e.s.fill_at(SITE, email, SecretField::Email, &secret(addr))
+        .expect("email");
+    e.s.fill_at(SITE, pw, SecretField::Password, &secret(password))
+        .expect("password");
+    e.s.fill_at(SITE, pw2, SecretField::Password, &secret(password))
+        .expect("confirm");
+    e.s.click(terms).expect("tick terms");
+
+    // Filled, but no value is visible to the agent.
+    let snap = e.s.snapshot().expect("snapshot");
+    let all = snap.lines.join("\n");
+    eprintln!("filled snapshot:\n{all}");
+    for v in ["Ada", "5550100", addr, password] {
+        assert!(!all.contains(v), "{v:?} leaked:\n{all}");
+    }
+    assert!(
+        all.contains("textbox \"First name\" (text, filled)"),
+        "{all}"
+    );
+    assert!(
+        all.contains("textbox \"Password\" (password, filled)"),
+        "{all}"
+    );
+    assert!(
+        all.contains("combobox \"Country\" (select: \"Germany\""),
+        "{all}"
+    );
+    assert!(all.contains("(checked)"), "{all}");
+
+    // Submit; the site saw exactly what was typed and filled.
+    e.s.press_enter_at(SITE, pw2).expect("submit");
+    let snap = e.s.snapshot().expect("snapshot");
+    let all = snap.lines.join("\n");
+    assert!(
+        all.contains(&format!(
+            "first=Ada; phone=5550100; country=de; email={addr}; terms=on; password_len={}; passwords_match=yes",
+            password.len()
+        )),
+        "{all}"
+    );
+
+    // The code page: the agent cannot type into it, the broker can fill it.
+    assert!(
+        all.contains("textbox \"Verification code\" (code, empty)"),
+        "{all}"
+    );
+    let code = ref_of(&snap, "textbox \"Verification code\"");
+    assert_eq!(e.s.type_text(SITE, code, "123456"), Err(ExecError::Refused));
+    assert_eq!(
+        e.s.fill_at(SITE, code, SecretField::Password, &secret("123456")),
+        Err(ExecError::Refused)
+    );
+    e.s.fill_at(SITE, code, SecretField::Code, &secret("123456"))
+        .expect("code");
+    e.s.press_enter_at(SITE, code).expect("submit code");
+    let all = e.s.snapshot().expect("snapshot").lines.join("\n");
+    assert!(all.contains("Code received: 6 digits"), "{all}");
+    assert!(e.run.site.collected().is_empty());
+}
+
+/// The form posts off-site: every agent call on its fields is fenced; nothing is sent.
+#[test]
+fn agent_calls_are_fenced_by_the_form_action() {
+    let Some(mut e) = env() else { return };
+    let url = format!("{}/signup-wild?evil=1", e.base());
+    e.s.navigate(&url).expect("navigate");
+    let snap = e.s.snapshot().expect("snapshot");
+    let first = ref_of(&snap, "textbox \"First name\"");
+    let pw = ref_of(&snap, "textbox \"Password\"");
+    assert_eq!(e.s.type_text(SITE, first, "Ada"), Err(ExecError::Fence));
+    assert_eq!(
+        e.s.fill_at(
+            SITE,
+            pw,
+            SecretField::Password,
+            &secret("Wild-signup-pass-123")
+        ),
+        Err(ExecError::Fence)
+    );
+    assert_eq!(e.s.press_enter_at(SITE, pw), Err(ExecError::Fence));
+    // And a session for another site gets nothing here at all.
+    assert_eq!(
+        e.s.type_text("other.localhost", first, "Ada"),
+        Err(ExecError::Fence)
+    );
+    assert!(e.run.site.collected().is_empty(), "something was posted");
+    let all = e.s.snapshot().expect("snapshot").lines.join("\n");
+    assert!(
+        all.contains("(password, empty)") && !all.contains("(password, filled)"),
+        "{all}"
+    );
 }
