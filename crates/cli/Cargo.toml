@@ -15,6 +15,11 @@ path = "src/main.rs"
 [dependencies]
 logindesk-core = { path = "../core" }
 logindesk-vault = { path = "../vault" }
+logindesk-policy = { path = "../policy" }
+logindesk-daemon = { path = "../daemon" }
+logindesk-mcp = { path = "../mcp" }
+serde_json = { workspace = true }
+url = { workspace = true }
 clap = { workspace = true }
 rpassword = { workspace = true }
 
