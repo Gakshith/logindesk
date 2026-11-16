@@ -44,8 +44,10 @@ done
 unset SITE_PW
 
 # 3. Let agents log in to the fake site with no prompt, and read codes from its outbox.
-"$B/logindesk" grant add example.localhost --tier auto >/dev/null
-"$B/logindesk" mail set outbox "http://example.localhost:$PORT" >/dev/null
+"$B/logindesk" grant add example.localhost --tier auto >/dev/null 2>&1
+"$B/logindesk" grant add example.localhost --tier auto --action signup >/dev/null 2>&1
+"$B/logindesk" identity set --email "me@example.localhost" --name "Test User" >/dev/null 2>&1
+"$B/logindesk" mail set outbox "http://example.localhost:$PORT" >/dev/null 2>&1
 
 # 4. Daemon: unlocked once, then serves agents. ${LOGINDESK_HEADFUL:-0}=1 shows the browser.
 ( printf '%s\n' "$VAULT_PW"; exec tail -f /dev/null ) |
@@ -63,12 +65,15 @@ In ANOTHER terminal:
   export LOGINDESK_VAULT="$LOGINDESK_VAULT"
   $B/logindesk login example.localhost --account alice@example.localhost
   $B/logindesk login example.localhost --account otp@example.localhost   # emailed code, read automatically
+  $B/logindesk signup example.localhost --url http://example.localhost:$PORT/signup   # new account, verified by email
+  $B/logindesk doctor
 
 Let Claude Code log in by itself:
 
   claude mcp add logindesk -e LOGINDESK_VAULT="$LOGINDESK_VAULT" -- $B/logindesk mcp
 
   then ask:  "Use logindesk to log in to example.localhost as alice and tell me what the account page says."
+        or:  "Use logindesk to sign up for example.localhost (signup page http://example.localhost:$PORT/signup)."
 
 See it in a visible browser: stop this (Ctrl-C) and rerun with LOGINDESK_HEADFUL=1.
 Audit log: $DIR/audit.jsonl     Ctrl-C here stops the site and the daemon.

@@ -246,7 +246,19 @@ fn mail(dir: &Path) -> Check {
             );
         }
     };
-    let Some(src) = cfg.source() else {
+    // Doctor never asks for the vault password, so it cannot load Gmail/IMAP
+    // credentials; those are checked by `logindesk connect status`.
+    if matches!(
+        cfg.kind,
+        logindesk_daemon::mailcfg::MailKind::Gmail | logindesk_daemon::mailcfg::MailKind::Imap
+    ) {
+        return ok(format!(
+            "mail: {:?} configured (live check: `logindesk connect status`)",
+            cfg.kind
+        ));
+    }
+    let creds = logindesk_daemon::mailcfg::MailCreds::default();
+    let Some(src) = cfg.source(&creds) else {
         return fail(
             "mail: no source for this config",
             "`logindesk mail set ...` again",

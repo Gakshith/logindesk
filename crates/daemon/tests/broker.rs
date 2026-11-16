@@ -1132,9 +1132,24 @@ fn signup_daily_limit() {
         ..Opts::default()
     });
     assert_eq!(tag(&signup(&h, "example.com", None)), "created");
-    assert_eq!(tag(&signup(&h, "example.com", None)), "created");
-    assert_eq!(tag(&signup(&h, "example.com", None)), "failed/rate_limited");
+    assert_eq!(tag(&signup(&h, "example.org", None)), "created");
+    assert_eq!(tag(&signup(&h, "example.net", None)), "failed/rate_limited");
     assert_eq!(h.script.calls.lock().unwrap().launches, 2);
+}
+
+#[test]
+fn signup_never_makes_a_second_account_with_the_same_identity() {
+    let h = harness(Opts::default());
+    assert_eq!(tag(&signup(&h, "example.com", None)), "created");
+    let r = signup(&h, "example.com", None);
+    assert_eq!(tag(&r), "failed/account_ambiguous", "{r:?}");
+    assert!(r.message.as_deref().unwrap_or("").contains("call login"));
+    assert_eq!(
+        h.script.calls.lock().unwrap().launches,
+        1,
+        "no browser for the refusal"
+    );
+    assert_eq!(signup_records(&h).len(), 1);
 }
 
 #[test]

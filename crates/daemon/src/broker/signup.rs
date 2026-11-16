@@ -120,6 +120,22 @@ impl Broker {
                 return Outcome::new(&failed(FailReason::Internal), site);
             }
         };
+        // Never create a second account with the user's own identity on a site:
+        // a taken plus-address must not silently fall back to a duplicate account.
+        let plain = identity.email.clone();
+        let plus = plus_address(&plain, &site);
+        match self.existing_identity_account(&site, &[plain.as_str(), plus.as_str()]) {
+            Ok(Some(user)) => {
+                return with_message(
+                    Outcome::new(&failed(FailReason::AccountAmbiguous), site),
+                    &format!(
+                        "an account already exists on this site as {user}; call login instead"
+                    ),
+                );
+            }
+            Ok(None) => {}
+            Err(s) => return Outcome::new(&s, site),
+        }
         match self.signups_today() {
             Ok(n) if n >= self.cfg.signups_per_day => {
                 return Outcome::new(&failed(FailReason::RateLimited), site);
@@ -151,6 +167,26 @@ impl Broker {
             tier,
             Box::new(move |b, token, req| b.signup_run(ctx, token, req)),
         )
+    }
+
+    /// A non-pending login record on `site` whose username is one of `emails`.
+    fn existing_identity_account(
+        &self,
+        site: &str,
+        emails: &[&str],
+    ) -> Result<Option<String>, Status> {
+        let st = lock(&self.state);
+        let keys = st.keys.as_ref().ok_or(Status::VaultLocked)?;
+        let metas = st.vault.list(keys).map_err(|e| {
+            eprintln!("logindesk: vault list failed: {e}");
+            failed(FailReason::Internal)
+        })?;
+        Ok(metas
+            .into_iter()
+            .filter(|m| m.kind == RecordKind::Login && m.notes != PENDING)
+            .filter(|m| site_of(&m.site).as_deref() == Some(site))
+            .find(|m| emails.iter().any(|e| m.username.eq_ignore_ascii_case(e)))
+            .map(|m| m.username))
     }
 
     /// Signup records created in the last 24 hours (survives restarts: read from the vault).
