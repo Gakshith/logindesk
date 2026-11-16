@@ -1,41 +1,64 @@
 # logindesk
 
-**Status: design and research. Nothing is built yet.**
-
-logindesk lets an AI agent log you in to websites, or sign you up, without the agent ever seeing your password.
+logindesk lets an AI agent log you in to websites, or sign you up, without the agent ever seeing your password or one-time code.
 
 ```text
 You:     "Claude, log in to my GitHub and check the last deploy."
 Claude → logindesk: login("github.com")
-logindesk: finds your account in its encrypted vault, opens its own browser,
-           fills the password itself, reads the email code itself,
-           asks you for one Touch ID tap
-logindesk → Claude: { status: "logged_in", sessionId: "…" }
+logindesk: finds the account in its encrypted vault, opens its own browser,
+           fills the password itself, reads the emailed code itself
+logindesk → Claude: { "status": "logged_in", "session_id": "…" }
 ```
 
-Claude gets the result and a logged-in page it can use. It never gets the password, the cookies or the one-time code.
+**Status: working prototype (macOS).** Login, signup with email verification, Gmail/IMAP code reading, approvals and the MCP tools run end to end on the included fake site. Real sites vary: some login forms are not mapped yet. Not audited; do not rely on it for important accounts yet.
 
-## Why
+## Install from source
 
-- Agents stop at login walls. The common fix is pasting a password into chat, where any prompt-injected page can steal it.
-- Every agent framework handles credentials in its own unsafe way.
-- Signing up is repetitive: an email address, a password, a verification code, every time.
+Needs Rust (see `rust-toolchain.toml`) and Google Chrome.
 
-## How it works (planned)
+```bash
+cargo build --release -p logindesk-cli
+cp target/release/logindesk ~/.local/bin/
+logindesk setup                                   # create the encrypted vault
+logindesk install --client claude-code            # or claude-desktop, cursor, vscode, codex, gemini
+logindesk daemon                                  # unlock once; leave it running
+```
 
-- **A local broker.** One program on your machine holds the encrypted vault and drives a visible browser. It is the only part that ever sees a secret.
-- **Plugs into any agent over MCP**: Claude Code, Claude Desktop, Cursor, VS Code and others. The agent gets intent tools (`login`, `signup`, `accounts_find`, …), never secrets.
-- **You approve every login and signup** on your own device, and the prompt names which agent is asking.
-- **Signups** use your email (`you+site@gmail.com`) and a generated password that goes straight into the vault.
-- **Email codes** are read by plain code, not by a model, from your own Gmail connection.
+Or, in Claude Code, install the plugin (it still needs the binary and a running daemon):
 
-## Documents
+```text
+/plugin install logindesk --marketplace Gakshith/logindesk
+```
 
-- [`docs/research.md`](docs/research.md): research report on the implementation, prior art, MCP client support, email access and risks.
+## Try it on the fake site
 
-## Run it
+```bash
+scripts/try-it.sh
+```
 
-Not runnable yet.
+Starts a throwaway vault, a fake website and the daemon, and prints what to run and what to ask Claude. Nothing touches your real vault, sites or mailbox.
+
+## Use it
+
+```bash
+logindesk vault import --csv passwords.csv --delete-csv   # Chrome, Firefox, Safari, Bitwarden, 1Password exports
+logindesk vault dedupe                                    # merge duplicate logins (keeps the newest)
+logindesk grant add github.com --tier auto                # this site: no prompt
+logindesk grant add example.com --tier auto --action signup
+logindesk identity set --email you@gmail.com --name "Your Name"
+logindesk connect gmail                                   # read emailed codes (or: connect imap)
+logindesk doctor                                          # check everything
+```
+
+Sites without a grant ask for Touch ID (or your Mac password) each time, and the prompt names the agent.
+
+## Security model
+
+- Secrets live only in the daemon (an encrypted vault, unlocked once like ssh-agent) and are typed into its own sealed browser. They never cross the MCP socket, so no tool result, log or audit line holds one.
+- Every login or signup passes a per-site grant (`auto`, `ask`, `deny`). Pages and links are fenced to the site's registrable domain, and the browser never fills a form on another site.
+- An append-only, hash-chained audit log records which agent did what, where.
+
+Details: [`docs/socket.md`](docs/socket.md) (protocol and flows), [`docs/mail.md`](docs/mail.md), [`SECURITY.md`](SECURITY.md), [`RESPONSIBLE_USE.md`](RESPONSIBLE_USE.md).
 
 ## Licence
 

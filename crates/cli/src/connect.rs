@@ -8,6 +8,7 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use clap::{Subcommand, ValueEnum};
+use logindesk_core::SecretString;
 use logindesk_daemon::mailcfg::{
     GMAIL_RECORD_SITE, IMAP_RECORD_SITE, MailConfig, MailCreds, MailKind, NOTE_CLIENT_SECRET,
     NOTE_REFRESH,
@@ -196,7 +197,7 @@ fn imap(
         .map_err(|()| "the user name cannot be used in a URL")?;
     let mut vault = Vault::open(vault_path)?;
     let keys = crate::unlock(&vault, prompt)?;
-    let pw = prompt.secret(&format!("App password for {user} on {host}: "))?;
+    let pw = app_password(prompt.secret(&format!("App password for {user} on {host}: "))?);
     if pw.expose().is_empty() {
         return Err("the app password must not be empty".into());
     }
@@ -208,6 +209,12 @@ fn imap(
     }
     .save(dir)?;
     finish(&mut vault, &keys, dir, &format!("IMAP {host}"))
+}
+
+/// Google shows an app password as four groups of four ("abcd efgh ijkl mnop");
+/// the real password has no spaces. Strip every whitespace character.
+fn app_password(pw: SecretString) -> SecretString {
+    SecretString::new(pw.expose().chars().filter(|c| !c.is_whitespace()).collect())
 }
 
 /// Test the stored connection; undo it if the mailbox refuses the credentials.
@@ -299,4 +306,16 @@ pub fn disconnect(vault_path: &Path, dir: &Path, prompt: &mut Prompter) -> Res {
         "For Gmail, also revoke access at https://myaccount.google.com/permissions if you no longer use it."
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod app_password_tests {
+    use super::*;
+
+    #[test]
+    fn strips_all_whitespace() {
+        let p = app_password(SecretString::new(" abcd efgh\tijkl\u{a0}mnop \n".into()));
+        assert_eq!(p.expose(), "abcdefghijklmnop");
+        assert_eq!(app_password(SecretString::new("   ".into())).expose(), "");
+    }
 }

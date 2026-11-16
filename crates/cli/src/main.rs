@@ -11,6 +11,7 @@ mod doctor;
 mod install;
 mod paths;
 mod prompt;
+mod vault_tools;
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -262,6 +263,8 @@ enum VaultCmd {
         #[arg(long)]
         delete_csv: bool,
     },
+    /// Merge duplicate logins (same site and username): keep the newest, delete the rest.
+    Dedupe,
 }
 
 fn main() -> ExitCode {
@@ -677,30 +680,31 @@ fn vault_cmd(
         }
         VaultCmd::Import { csv, delete_csv } => {
             let rows = logindesk_vault::parse_import_csv(std::fs::File::open(&csv)?)?;
-            let n = rows.len();
-            for row in rows {
-                vault.add(
-                    &keys,
-                    NewRecord {
-                        kind: RecordKind::Login,
-                        site: row.site,
-                        username: row.username,
-                        secret: row.secret,
-                        created_by: "import:csv".into(),
-                        notes: row.notes,
-                    },
-                )?;
-            }
+            let c = vault_tools::import(&mut vault, &keys, rows)?;
+            let summary = format!(
+                "Imported {}, updated {}, skipped {} duplicate(s).",
+                c.imported, c.updated, c.skipped
+            );
             if delete_csv {
                 wipe_file(&csv)?;
-                eprintln!("Imported {n} login(s). The plaintext CSV was overwritten and deleted.");
+                eprintln!("{summary} The plaintext CSV was overwritten and deleted.");
             } else {
                 eprintln!(
-                    "Imported {n} login(s). The CSV still holds them in plaintext: delete {} now \
+                    "{summary} The CSV still holds them in plaintext: delete {} now \
                      (or import with --delete-csv).",
                     csv.display()
                 );
             }
+        }
+        VaultCmd::Dedupe => {
+            let gone = vault_tools::dedupe(&mut vault, &keys)?;
+            for m in &gone {
+                writeln!(out, "removed {}  {:<30}  {}", m.id, m.site, m.username)?;
+            }
+            eprintln!(
+                "Removed {} duplicate(s); the newest record of each account was kept.",
+                gone.len()
+            );
         }
     }
     Ok(())

@@ -10,7 +10,7 @@
   "plugins": [
     {
       "name": "logindesk",
-      "source": "./",
+      "source": "./plugin",
       "description": "Log in to websites for the user without the agent ever seeing a secret. Needs the logindesk binary on PATH and a running `logindesk daemon`.",
       "category": "security"
     }
