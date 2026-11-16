@@ -25,4 +25,7 @@ tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "sig
 http-body-util.workspace = true
 tempfile.workspace = true
 tower = { workspace = true, features = ["util"] }
-
+logindesk-executor = { path = "../crates/executor" }
+logindesk-approver = { path = "../crates/approver" }
+logindesk-core = { path = "../crates/core" }
+logindesk-policy = { path = "../crates/policy" }

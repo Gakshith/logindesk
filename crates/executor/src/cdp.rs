@@ -5,6 +5,7 @@ use std::sync::mpsc::{Receiver, RecvTimeoutError, channel};
 use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
+use zeroize::Zeroize;
 
 use crate::ExecError;
 
@@ -30,10 +31,10 @@ impl Cdp {
                         if buf.last() == Some(&0) {
                             buf.pop();
                         }
-                        if let Ok(v) = serde_json::from_slice::<Value>(&buf) {
-                            if etx.send(v).is_err() {
-                                break;
-                            }
+                        if let Ok(v) = serde_json::from_slice::<Value>(&buf)
+                            && etx.send(v).is_err()
+                        {
+                            break;
                         }
                     }
                 }
@@ -67,13 +68,44 @@ impl Cdp {
         if let Some(s) = session {
             msg["sessionId"] = json!(s);
         }
-        let mut bytes = serde_json::to_vec(&msg).map_err(|_| ExecError::Browser("encode"))?;
+        let bytes = serde_json::to_vec(&msg).map_err(|_| ExecError::Browser("encode"))?;
+        self.write_and_wait(id, bytes, limit)
+    }
+
+    /// `Input.insertText` on the page session for a secret. The frame is built by hand
+    /// (no `serde_json::Value` holding a copy) and every buffer is zeroized after the write.
+    pub(crate) fn insert_secret_text(&mut self, text: &str) -> Result<(), ExecError> {
+        self.next += 1;
+        let id = self.next;
+        let mut head = json!({"id": id, "method": "Input.insertText"});
+        if let Some(s) = &self.session {
+            head["sessionId"] = json!(s);
+        }
+        let head = serde_json::to_vec(&head).map_err(|_| ExecError::Browser("encode"))?;
+        let mut quoted = serde_json::to_vec(text).map_err(|_| ExecError::Browser("encode"))?;
+        let mut bytes = Vec::with_capacity(head.len() + quoted.len() + 16);
+        // `head` ends with '}': reopen it to append the params object.
+        bytes.extend_from_slice(&head[..head.len() - 1]);
+        bytes.extend_from_slice(br#","params":{"text":"#);
+        bytes.extend_from_slice(&quoted);
+        bytes.extend_from_slice(b"}}");
+        quoted.zeroize();
+        self.write_and_wait(id, bytes, Duration::from_secs(15))
+            .map(|_| ())
+    }
+
+    /// Write one frame (zeroized afterwards) and wait for the reply with `id`.
+    fn write_and_wait(
+        &mut self,
+        id: u64,
+        mut bytes: Vec<u8>,
+        limit: Duration,
+    ) -> Result<Value, ExecError> {
         bytes.push(0);
-        self.tx
-            .write_all(&bytes)
-            .map_err(|_| ExecError::Browser("pipe closed"))?;
-        // Zero the outgoing buffer: it may hold a secret from Input.insertText.
-        bytes.iter_mut().for_each(|b| *b = 0);
+        let wrote = self.tx.write_all(&bytes);
+        // The buffer may hold a secret (Input.insertText): wipe it before anything else.
+        bytes.zeroize();
+        wrote.map_err(|_| ExecError::Browser("pipe closed"))?;
         let deadline = Instant::now() + limit;
         loop {
             let v = self.recv(deadline)?;
@@ -104,13 +136,23 @@ impl Cdp {
 
     /// Wait for an event, consuming it. Times out with `ExecError::Timeout`.
     pub(crate) fn wait_event(&mut self, method: &str, limit: Duration) -> Result<Value, ExecError> {
-        if let Some(i) = self.backlog.iter().position(|v| v["method"] == method) {
+        self.wait_any(&[method], limit)
+    }
+
+    /// Wait for the first event whose method is in `methods`, consuming it.
+    pub(crate) fn wait_any(
+        &mut self,
+        methods: &[&str],
+        limit: Duration,
+    ) -> Result<Value, ExecError> {
+        let hit = |v: &Value| v["method"].as_str().is_some_and(|m| methods.contains(&m));
+        if let Some(i) = self.backlog.iter().position(hit) {
             return Ok(self.backlog.remove(i));
         }
         let deadline = Instant::now() + limit;
         loop {
             let v = self.recv(deadline)?;
-            if v["method"] == method {
+            if hit(&v) {
                 return Ok(v);
             }
         }

@@ -15,6 +15,7 @@ logindesk-approver = { path = "../approver" }
 serde_json = { workspace = true }
 url = { workspace = true }
 libc = { workspace = true }
+zeroize = { workspace = true }
 
 # Restated: `unsafe_code = "deny"` so ONE module, src/spawn.rs, can allow it to put
 # the CDP pipe on fds 3/4 in the child (pre_exec + dup2).
