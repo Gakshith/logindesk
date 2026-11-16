@@ -408,3 +408,33 @@ fn missing_vault_points_to_setup() {
         o.stderr
     );
 }
+
+/// Without a controlling terminal (CI, an agent's shell), asking for the vault
+/// password must say what to do, not "Device not configured (os error 6)".
+/// Skips when the test itself runs in a terminal.
+#[test]
+fn no_terminal_gives_a_clear_error() {
+    if std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open("/dev/tty")
+        .is_ok()
+    {
+        eprintln!("SKIP: this test needs to run without a controlling terminal");
+        return;
+    }
+    let t = Tmp::new("notty");
+    setup(&t);
+    let o = Command::new(env!("CARGO_BIN_EXE_logindesk"))
+        .arg("--vault")
+        .arg(t.vault())
+        .args(["vault", "list"])
+        .env_remove("LOGINDESK_VAULT")
+        .stdin(Stdio::null())
+        .output()
+        .unwrap();
+    let err = String::from_utf8_lossy(&o.stderr);
+    assert!(!o.status.success());
+    assert!(err.contains("needs a terminal for the vault password (or use --password-stdin)"), "{err}");
+    assert!(!err.contains("os error"), "{err}");
+}
