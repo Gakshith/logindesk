@@ -1373,7 +1373,13 @@ fn the_prompt_and_the_audit_name_the_agent() {
     assert_eq!(tag(&h.broker.handle(&r)), "logged_in");
     let shown = h.prompts.lock().unwrap().clone();
     assert_eq!(shown.len(), 1);
-    assert!(shown[0].contains("\"claude-code\" (unverified)"), "{shown:?}");
+    assert!(
+        shown[0].contains("\"claude-code\" (unverified)"),
+        "{shown:?}"
+    );
     let audit = std::fs::read_to_string(h.tmp.0.join("audit.jsonl")).unwrap();
-    assert!(audit.contains(r#""client":"claude-code","op":"login""#), "{audit}");
+    assert!(
+        audit.contains(r#""client":"claude-code","op":"login""#),
+        "{audit}"
+    );
 }

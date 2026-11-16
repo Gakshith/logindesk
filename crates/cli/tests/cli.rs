@@ -240,7 +240,8 @@ fn reimport_skips_duplicates_and_updates_changed_passwords() {
     let o = import(&t);
     assert!(o.ok, "{}", o.stderr);
     assert!(
-        o.stderr.contains("Imported 2, updated 0, skipped 1 duplicate(s)."),
+        o.stderr
+            .contains("Imported 2, updated 0, skipped 1 duplicate(s)."),
         "{}",
         o.stderr
     );
@@ -249,7 +250,8 @@ fn reimport_skips_duplicates_and_updates_changed_passwords() {
     // The same file again: nothing new.
     let o = import(&t);
     assert!(
-        o.stderr.contains("Imported 0, updated 0, skipped 3 duplicate(s)."),
+        o.stderr
+            .contains("Imported 0, updated 0, skipped 3 duplicate(s)."),
         "{}",
         o.stderr
     );
@@ -263,7 +265,8 @@ fn reimport_skips_duplicates_and_updates_changed_passwords() {
     .unwrap();
     let o = import(&t);
     assert!(
-        o.stderr.contains("Imported 1, updated 1, skipped 0 duplicate(s)."),
+        o.stderr
+            .contains("Imported 1, updated 1, skipped 0 duplicate(s)."),
         "{}",
         o.stderr
     );
@@ -273,7 +276,13 @@ fn reimport_skips_duplicates_and_updates_changed_passwords() {
     let out = t.0.join("plain.csv");
     let o = run(
         &t.vault(),
-        &["vault", "export", "--plaintext", "--out", out.to_str().unwrap()],
+        &[
+            "vault",
+            "export",
+            "--plaintext",
+            "--out",
+            out.to_str().unwrap(),
+        ],
         &[PW, PW],
     );
     assert!(o.ok, "{}", o.stderr);
@@ -305,7 +314,11 @@ fn dedupe_keeps_the_newest_record_of_each_account() {
     assert!(o.ok, "{}", o.stderr);
     assert!(o.stderr.contains("Removed 1 duplicate(s)"), "{}", o.stderr);
     assert_eq!(o.stdout.lines().count(), 1);
-    assert!(!o.stdout.contains(&newest), "the newest is kept: {}", o.stdout);
+    assert!(
+        !o.stdout.contains(&newest),
+        "the newest is kept: {}",
+        o.stdout
+    );
     assert_no_leak(&o, &["CANARY-dd"]);
     assert_eq!(login_rows(&t), 3);
     let o = run(&t.vault(), &["vault", "list"], &[PW]);
@@ -435,6 +448,9 @@ fn no_terminal_gives_a_clear_error() {
         .unwrap();
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(!o.status.success());
-    assert!(err.contains("needs a terminal for the vault password (or use --password-stdin)"), "{err}");
+    assert!(
+        err.contains("needs a terminal for the vault password (or use --password-stdin)"),
+        "{err}"
+    );
     assert!(!err.contains("os error"), "{err}");
 }

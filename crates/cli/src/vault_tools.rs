@@ -8,7 +8,9 @@ use std::collections::HashMap;
 
 use logindesk_core::SecretString;
 use logindesk_policy::site_of;
-use logindesk_vault::{ImportRow, Keys, NewRecord, RecordId, RecordKind, RecordMeta, Result, Vault};
+use logindesk_vault::{
+    ImportRow, Keys, NewRecord, RecordId, RecordKind, RecordMeta, Result, Vault,
+};
 
 /// (registrable domain or the trimmed lowercase site, trimmed username).
 pub type Key = (String, String);

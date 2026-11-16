@@ -8,13 +8,13 @@ use std::process::Command;
 use std::time::{Duration, SystemTime};
 
 use clap::{Subcommand, ValueEnum};
+use logindesk_core::SecretString;
 use logindesk_daemon::mailcfg::{
     GMAIL_RECORD_SITE, IMAP_RECORD_SITE, MailConfig, MailCreds, MailKind, NOTE_CLIENT_SECRET,
     NOTE_REFRESH,
 };
 use logindesk_mail::oauth::{GOOGLE_AUTH_URL, Loopback, Pkce, exchange_code};
 use logindesk_mail::{GOOGLE_TOKEN_URL, MailError, MailQuery};
-use logindesk_core::SecretString;
 use logindesk_vault::{Keys, Vault};
 
 use crate::prompt::Prompter;
@@ -214,12 +214,7 @@ fn imap(
 /// Google shows an app password as four groups of four ("abcd efgh ijkl mnop");
 /// the real password has no spaces. Strip every whitespace character.
 fn app_password(pw: SecretString) -> SecretString {
-    SecretString::new(
-        pw.expose()
-            .chars()
-            .filter(|c| !c.is_whitespace())
-            .collect(),
-    )
+    SecretString::new(pw.expose().chars().filter(|c| !c.is_whitespace()).collect())
 }
 
 /// Test the stored connection; undo it if the mailbox refuses the credentials.
