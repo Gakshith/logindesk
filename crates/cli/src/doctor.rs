@@ -219,7 +219,7 @@ fn browser_smoke() -> Check {
         }
     };
     let profile = std::env::temp_dir().join(format!("logindesk-doctor-{}", std::process::id()));
-    let result = (|| {
+    let attempt = || {
         let mut s = Session::launch(&BrowserConfig {
             chrome: None,
             profile_dir: profile.clone(),
@@ -227,7 +227,12 @@ fn browser_smoke() -> Check {
         })?;
         s.navigate(&format!("http://{SITE}:{port}/"))?;
         s.rehearse(SITE, FormKind::Login)
-    })();
+    };
+    // A busy machine can make Chrome slow to start or to reach the page: one retry.
+    let result = match attempt() {
+        Err(ExecError::Timeout | ExecError::Unreachable) => attempt(),
+        r => r,
+    };
     stop.store(true, Ordering::Relaxed);
     let _ = server.join();
     let _ = std::fs::remove_dir_all(&profile);

@@ -179,8 +179,23 @@ async fn wild_page(
     ))
 }
 
-async fn wild_submit(Form(f): Form<HashMap<String, String>>) -> Html<String> {
+async fn wild_submit(
+    State(site): State<Shared>,
+    Form(f): Form<HashMap<String, String>>,
+) -> Html<String> {
     let (pw, confirm) = (field(&f, "password"), field(&f, "confirm"));
+    let email = field(&f, "email").to_string();
+    if email.contains('@') {
+        // Like a real site: email a code, and keep it to check on the code page.
+        let code = super::six_digits();
+        site.inner().pending_otp.insert(email.clone(), code.clone());
+        site.send_mail(
+            &email,
+            "Your Example verification code",
+            format!("Your verification code is {code}.\n"),
+        )
+        .await;
+    }
     let summary = format!(
         "first={}; phone={}; country={}; email={}; terms={}; password_len={}; passwords_match={}",
         field(&f, "first"),
@@ -200,21 +215,30 @@ async fn wild_submit(Form(f): Form<HashMap<String, String>>) -> Html<String> {
         &format!(
             r#"<p role="status">{}</p>
 <form method="post" action="/signup-wild/code">
+  <input type="hidden" name="email" value="{e}">
   <label for="vc">Verification code</label> <input id="vc" name="code" inputmode="numeric" autocomplete="one-time-code">
   <button type="submit">Verify</button>
 </form>"#,
-            esc(&summary)
+            esc(&summary),
+            e = esc(&email)
         ),
     ))
 }
 
-async fn wild_code(Form(f): Form<HashMap<String, String>>) -> Html<String> {
-    let n = field(&f, "code")
-        .chars()
-        .filter(char::is_ascii_digit)
-        .count();
+async fn wild_code(
+    State(site): State<Shared>,
+    Form(f): Form<HashMap<String, String>>,
+) -> Html<String> {
+    let code = field(&f, "code");
+    let n = code.chars().filter(char::is_ascii_digit).count();
+    let valid = site
+        .inner()
+        .pending_otp
+        .get(field(&f, "email"))
+        .is_some_and(|c| c == code.trim());
+    let valid = if valid { "yes" } else { "no" };
     Html(page(
         "Welcome",
-        &format!("<p role=\"status\">Code received: {n} digits</p>"),
+        &format!("<p role=\"status\">Code received: {n} digits; valid={valid}</p>"),
     ))
 }

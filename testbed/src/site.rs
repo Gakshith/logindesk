@@ -349,7 +349,7 @@ fn field<'a>(f: &'a HashMap<String, String>, k: &str) -> &'a str {
     f.get(k).map(String::as_str).unwrap_or("")
 }
 
-fn six_digits() -> String {
+pub(super) fn six_digits() -> String {
     format!(
         "{:06}",
         rand::RngExt::random_range(&mut rand::rng(), 0..1_000_000u32)
