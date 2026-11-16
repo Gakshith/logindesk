@@ -1,12 +1,28 @@
 [package]
 name = "logindesk-daemon"
-description = "logindesk broker daemon (skeleton)."
+description = "logindesk broker daemon: holds the unlocked vault, drives the sealed browser, answers the MCP socket."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
 publish.workspace = true
+
+[dependencies]
+logindesk-core = { path = "../core" }
+logindesk-vault = { path = "../vault" }
+logindesk-policy = { path = "../policy" }
+logindesk-approver = { path = "../approver" }
+logindesk-executor = { path = "../executor" }
+logindesk-mail = { path = "../mail" }
+serde = { workspace = true }
+serde_json = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+url = { workspace = true }
+
+[dev-dependencies]
+logindesk-approver = { path = "../approver", features = ["test-doubles"] }
 
 [lints]
 workspace = true
