@@ -95,16 +95,19 @@ canary.scan(&cap).assert_clean();
 
 **What the scanner matches.** It starts from every *text form* of each marker:
 - raw
-- JSON-escaped (UTF-8 and `\u` forms)
+- JSON-escaped, JSON nested in a JSON string (MCP's `content[].text` shape), and JSON `\u`-escaped
 - URL-encoded (`%20`, `+`, lower-case hex)
 
-Each text form is then matched:
+Each text form is matched:
 - as itself
 - as base64 and base64url at all 3 byte alignments
 - as hex (lower and upper case)
-- as every 8-character window that contains at least 5 alphanumerics
 
-So composites are caught, for example `base64url({"password": marker})` in a JWT-style token or cookie, `hex(json)`, and `data:…;base64,` JSON.
+**Truncated leaks.** Windows are chosen over the **raw** marker: 8 consecutive characters, at least 5 of them alphanumerics from the marker itself. Each window is then encoded into every text form. This means escape digits (`%C3%A9`, `\u00e9`) never count as entropy, so non-English pages don't cause false hits. The test `non_english_snapshot_is_clean` scans 200 × 10 fresh markers over a French/German snapshot and must stay clean.
+
+**Composites are caught too:** `base64url({"password": marker})` in a JWT-style token or cookie, `hex(json)`, `data:…;base64,` JSON, and base64 of JSON nested in JSON.
+
+**How the scan runs:** the scanner reads raw bytes (no lossy UTF-8 decoding) in one pass per channel. Every needle is indexed by its first 8 bytes.
 
 `Capture::dir` scans file names as well as file contents. A file or directory that can't be read (a wrong audit-log path, say) is recorded as a `CAPTURE ERROR` and **fails** the report. It never counts as clean.
 
