@@ -6,6 +6,8 @@
 //! which writes to a file, never to a stream.
 #![forbid(unsafe_code)]
 
+mod doctor;
+mod install;
 mod paths;
 mod prompt;
 
@@ -80,6 +82,30 @@ enum Cmd {
     /// Where the daemon reads emailed one-time codes.
     #[command(subcommand)]
     Mail(MailCmd),
+    /// Add logindesk to an MCP client's config (absolute binary path; backs the file up).
+    Install {
+        /// Which client.
+        #[arg(long, value_enum)]
+        client: install::Client,
+        /// Print the change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Remove logindesk from an MCP client's config (other entries are kept).
+    Uninstall {
+        /// Which client.
+        #[arg(long, value_enum)]
+        client: install::Client,
+        /// Print the change; write nothing.
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Check Chrome, the vault, the daemon, grants, mail, client configs and MCP stdout.
+    Doctor {
+        /// Also show the Touch ID / Mac password sheet once.
+        #[arg(long)]
+        popup: bool,
+    },
     /// Log in to a site through the daemon (as client "cli") and print the reply.
     Login {
         /// Host or URL.
@@ -212,6 +238,7 @@ fn harden() {
 }
 
 fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
+    let explicit_vault = cli.vault.clone();
     let path = match cli.vault {
         Some(p) => p,
         None => paths::default_vault_path()?,
@@ -284,6 +311,11 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
         Cmd::Mcp => Ok(logindesk_mcp::run(data_dir(&path))?),
         Cmd::Grant(cmd) => grant_cmd(&path, cmd),
         Cmd::Mail(cmd) => mail_cmd(&data_dir(&path), cmd),
+        Cmd::Install { client, dry_run } => {
+            install::cmd(client, explicit_vault.as_deref(), false, dry_run)
+        }
+        Cmd::Uninstall { client, dry_run } => install::cmd(client, None, true, dry_run),
+        Cmd::Doctor { popup } => doctor::cmd(&path, &data_dir(&path), popup),
         Cmd::Login { site, account } => {
             let mut op = json!({"op": "login", "site": site});
             if let Some(a) = account {

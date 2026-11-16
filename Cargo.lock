@@ -1030,8 +1030,10 @@ name = "logindesk-cli"
 version = "0.0.0"
 dependencies = [
  "clap",
+ "logindesk-approver",
  "logindesk-core",
  "logindesk-daemon",
+ "logindesk-mail",
  "logindesk-mcp",
  "logindesk-policy",
  "logindesk-vault",

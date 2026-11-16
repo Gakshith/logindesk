@@ -1,0 +1,18 @@
+{
+  "name": "logindesk",
+  "owner": {
+    "name": "logindesk contributors",
+    "url": "https://github.com/Gakshith/logindesk"
+  },
+  "metadata": {
+    "description": "The logindesk plugin for Claude Code."
+  },
+  "plugins": [
+    {
+      "name": "logindesk",
+      "source": "./",
+      "description": "Log in to websites for the user without the agent ever seeing a secret. Needs the logindesk binary on PATH and a running `logindesk daemon`.",
+      "category": "security"
+    }
+  ]
+}

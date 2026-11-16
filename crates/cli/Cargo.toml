@@ -18,6 +18,8 @@ logindesk-vault = { path = "../vault" }
 logindesk-policy = { path = "../policy" }
 logindesk-daemon = { path = "../daemon" }
 logindesk-mcp = { path = "../mcp" }
+logindesk-approver = { path = "../approver" }
+logindesk-mail = { path = "../mail" }
 serde_json = { workspace = true }
 url = { workspace = true }
 clap = { workspace = true }
