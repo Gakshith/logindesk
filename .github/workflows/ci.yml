@@ -26,6 +26,7 @@ jobs:
       matrix:
         os: [macos-latest, ubuntu-latest]
     runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -41,9 +42,45 @@ jobs:
       - name: test
         run: cargo test --workspace --locked
 
+  guards:
+    name: dependency and unsafe guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: logindesk-core never depends on serde
+        run: |
+          if cargo tree -p logindesk-core -e normal --locked --prefix none | grep -E '^serde'; then
+            echo "::error::logindesk-core must not depend on serde (Secret<T> must stay unserializable)"
+            exit 1
+          fi
+      - name: unsafe is forbidden outside crates/vault/src/hardening.rs
+        run: |
+          # Every crate except vault inherits workspace lints (unsafe_code = forbid).
+          for f in crates/*/Cargo.toml testbed/Cargo.toml; do
+            [ "$f" = crates/vault/Cargo.toml ] && continue
+            grep -q '^workspace = true' "$f" || { echo "::error file=$f::must inherit [lints] workspace = true"; exit 1; }
+          done
+          grep -q '^unsafe_code = "deny"' crates/vault/Cargo.toml || { echo "::error::vault must deny unsafe_code"; exit 1; }
+          # Exactly one allow(unsafe_code) in the tree, directly on `pub mod hardening;` in vault.
+          hits=$(grep -rn --include='*.rs' 'allow(unsafe_code)' crates testbed || true)
+          [ "$(printf '%s\n' "$hits" | grep -c .)" = 1 ] && printf '%s\n' "$hits" | grep -q '^crates/vault/src/lib.rs:' \
+            && grep -A1 'allow(unsafe_code)' crates/vault/src/lib.rs | grep -q '^pub mod hardening;$' \
+            || { echo "::error::unexpected allow(unsafe_code):"; echo "$hits"; exit 1; }
+          # No unsafe block, fn, impl or extern anywhere else.
+          other=$(grep -rnE --include='*.rs' '\bunsafe[[:space:]]*(\{|fn|impl|extern)' crates testbed | grep -v '^crates/vault/src/hardening.rs:' || true)
+          [ -z "$other" ] || { echo "::error::unsafe outside crates/vault/src/hardening.rs:"; echo "$other"; exit 1; }
+
   supply-chain:
     name: cargo deny · cargo audit
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     steps:
@@ -63,6 +100,7 @@ jobs:
   gitleaks:
     name: gitleaks (full history)
     runs-on: ubuntu-latest
+    timeout-minutes: 20
     permissions:
       contents: read
     env:

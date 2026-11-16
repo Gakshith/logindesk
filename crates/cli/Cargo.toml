@@ -8,9 +8,15 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
-
 [[bin]]
 name = "logindesk"
 path = "src/main.rs"
+
+[dependencies]
+logindesk-core = { path = "../core" }
+logindesk-vault = { path = "../vault" }
+clap = { workspace = true }
+rpassword = { workspace = true }
+
+[lints]
+workspace = true
