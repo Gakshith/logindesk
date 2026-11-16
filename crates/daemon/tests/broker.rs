@@ -44,12 +44,18 @@ struct Calls {
     signup_fills: Vec<(String, String)>,
     otp_codes: Vec<String>,
     pending_seen_before_submit: usize,
+    /// Order of navigate / check / approve / fill, as they happened.
+    events: Vec<&'static str>,
 }
 
 /// Called with the generated password inside `fill_signup`, before "submit".
 type Probe = Box<dyn Fn(&str) -> bool + Send + Sync>;
 
 struct Script {
+    /// What the login page looks like before any fill.
+    landing: PageState,
+    /// The landing page has no text field at all.
+    fieldless: bool,
     after_fill: Result<PageState, ExecError>,
     signup_states: Mutex<VecDeque<Result<PageState, ExecError>>>,
     rules: Option<String>,
@@ -64,12 +70,10 @@ struct FakeBrowser {
 
 impl Browser for FakeBrowser {
     fn navigate(&mut self, url: &str) -> Result<(), ExecError> {
-        self.script
-            .calls
-            .lock()
-            .unwrap()
-            .navigations
-            .push(url.into());
+        let mut c = self.script.calls.lock().unwrap();
+        c.events.push("navigate");
+        c.navigations.push(url.into());
+        drop(c);
         self.url = url.into();
         Ok(())
     }
@@ -80,10 +84,17 @@ impl Browser for FakeBrowser {
         Ok(Snapshot {
             url: self.url.clone(),
             title: "Dashboard".into(),
-            lines: vec![
-                "[11] link \"Settings\"".into(),
-                "[12] textbox \"Password\" (filled)".into(),
-            ],
+            lines: if self.script.fieldless && self.script.calls.lock().unwrap().fills.is_empty() {
+                vec![
+                    "[11] link \"Settings\"".into(),
+                    "[13] searchbox \"Search\" (empty)".into(),
+                ]
+            } else {
+                vec![
+                    "[11] link \"Settings\"".into(),
+                    "[12] textbox \"Password\" (filled)".into(),
+                ]
+            },
         })
     }
     fn click(&mut self, node_ref: u64) -> Result<(), ExecError> {
@@ -95,7 +106,13 @@ impl Browser for FakeBrowser {
         }
     }
     fn page_state(&mut self) -> Result<PageState, ExecError> {
-        Ok(PageState::LoggedIn)
+        let mut c = self.script.calls.lock().unwrap();
+        if c.fills.is_empty() && c.signup_fills.is_empty() {
+            c.events.push("check");
+            Ok(self.script.landing)
+        } else {
+            Ok(PageState::LoggedIn)
+        }
     }
     fn fill_login(
         &mut self,
@@ -113,6 +130,7 @@ impl Browser for FakeBrowser {
             MARKER,
             "the vault password reaches the fill"
         );
+        self.script.calls.lock().unwrap().events.push("fill");
         self.script
             .calls
             .lock()
@@ -196,11 +214,15 @@ impl Approver for Slow {
 struct Counting {
     inner: Scripted,
     asked: Arc<AtomicUsize>,
+    script: Arc<Script>,
+    names: Arc<Mutex<Vec<String>>>,
 }
 
 impl Approver for Counting {
     fn approve(&self, req: &ApprovalRequest, limit: Duration) -> ApprovalOutcome {
         self.asked.fetch_add(1, Ordering::SeqCst);
+        self.script.calls.lock().unwrap().events.push("approve");
+        self.names.lock().unwrap().push(req.prompt_text());
         self.inner.approve(req, limit)
     }
 }
@@ -275,9 +297,13 @@ struct H {
     broker: Arc<Broker>,
     script: Arc<Script>,
     asked: Arc<AtomicUsize>,
+    /// Prompt texts shown, in order.
+    prompts: Arc<Mutex<Vec<String>>>,
 }
 
 struct Opts {
+    landing: PageState,
+    fieldless: bool,
     signup_states: Vec<Result<PageState, ExecError>>,
     identity: Option<(&'static str, &'static str)>,
     signup_grants: &'static [(&'static str, Tier)],
@@ -303,6 +329,8 @@ impl Default for Opts {
             accounts: &[("example.com", "alice@example.com")],
             grants: &[("example.com", Tier::Auto)],
             lock_after: None,
+            landing: PageState::LoginForm,
+            fieldless: false,
             signup_states: Vec::new(),
             identity: Some(("you@mail.test", "Ann Example")),
             signup_grants: &[("example.com", Tier::Auto)],
@@ -384,6 +412,8 @@ fn harness(o: Opts) -> H {
             .any(|r| r.meta.notes == "pending" && r.secret.expose() == pw)
     });
     let script = Arc::new(Script {
+        landing: o.landing,
+        fieldless: o.fieldless,
         after_fill: o.after_fill,
         signup_states: Mutex::new(o.signup_states.into()),
         rules: o.rules.map(Into::into),
@@ -391,11 +421,14 @@ fn harness(o: Opts) -> H {
         calls: Mutex::new(Calls::default()),
     });
     let asked = Arc::new(AtomicUsize::new(0));
+    let prompts = Arc::new(Mutex::new(Vec::new()));
     let approver: Box<dyn Approver> = match o.slow {
         Some((d, outcome)) => Box::new(Slow(d, outcome, Arc::clone(&asked))),
         None => Box::new(Counting {
             inner: Scripted(o.approve),
             asked: Arc::clone(&asked),
+            script: Arc::clone(&script),
+            names: Arc::clone(&prompts),
         }),
     };
     let deps = Deps {
@@ -409,6 +442,7 @@ fn harness(o: Opts) -> H {
         broker,
         script,
         asked,
+        prompts,
     }
 }
 
@@ -475,9 +509,12 @@ fn ask_tier_prompts_and_maps_every_outcome() {
         let r = login(&h, "example.com", None);
         assert_eq!(tag(&r), want, "{outcome:?}");
         assert_eq!(h.asked.load(Ordering::SeqCst), 1);
-        if want != "logged_in" {
-            let c = h.script.calls.lock().unwrap();
-            assert_eq!(c.launches, 0, "no browser before a yes");
+        let c = h.script.calls.lock().unwrap();
+        if want == "logged_in" {
+            assert_eq!(c.events, ["navigate", "check", "approve", "fill"]);
+        } else {
+            // The page was opened and checked, but nothing was filled without a yes.
+            assert_eq!(c.events, ["navigate", "check", "approve"], "{outcome:?}");
             assert!(c.fills.is_empty());
         }
     }
@@ -1196,11 +1233,11 @@ fn unanswered_prompt_returns_a_handle_and_wait_collects_the_result() {
     let handle = r.handle.clone().unwrap();
     assert_eq!(handle.len(), 32);
     assert_eq!(h.broker.pending_count(), 1);
-    assert_eq!(
-        h.script.calls.lock().unwrap().launches,
-        0,
-        "no browser before a yes"
-    );
+    // The page is open and checked; nothing is filled before a yes.
+    let c = h.script.calls.lock().unwrap();
+    assert_eq!(c.events, ["navigate", "check"]);
+    assert!(c.fills.is_empty());
+    drop(c);
 
     // Still unanswered: wait returns the same handle state again.
     let again = h.broker.handle(&req(Op::Wait {
@@ -1271,4 +1308,72 @@ fn wait_handle_carries_a_denial_and_a_signup() {
         ..Opts::default()
     });
     assert_eq!(tag(&login(&h, "example.com", None)), "logged_in");
+}
+
+#[test]
+fn precheck_runs_before_the_prompt_and_can_end_without_one() {
+    // No field at all on the page: fail before any popup.
+    let h = harness(Opts {
+        grants: &[],
+        landing: PageState::Unknown,
+        fieldless: true,
+        ..Opts::default()
+    });
+    let r = login(&h, "example.com", None);
+    assert_eq!(tag(&r), "failed/field_mapping_failed");
+    assert_eq!(h.asked.load(Ordering::SeqCst), 0, "no pointless popup");
+    let c = h.script.calls.lock().unwrap();
+    assert_eq!(c.events, ["navigate", "check"]);
+    assert_eq!(c.closes, 1);
+    drop(c);
+    assert!(r.account_id.is_some());
+
+    // A CAPTCHA on the login page: the user is needed, no prompt.
+    let h = harness(Opts {
+        grants: &[],
+        landing: PageState::Captcha,
+        ..Opts::default()
+    });
+    assert_eq!(tag(&login(&h, "example.com", None)), "needs_user/captcha");
+    assert_eq!(h.asked.load(Ordering::SeqCst), 0);
+
+    // A two-step page (email only, no password yet): the pre-check passes and the
+    // fill decides, after approval.
+    let h = harness(Opts {
+        grants: &[],
+        landing: PageState::LoggedIn,
+        ..Opts::default()
+    });
+    assert_eq!(tag(&login(&h, "example.com", None)), "logged_in");
+    assert_eq!(
+        h.script.calls.lock().unwrap().events,
+        ["navigate", "check", "approve", "fill"]
+    );
+
+    // Deny is decided before the page is even opened.
+    let h = harness(Opts {
+        grants: &[("example.com", Tier::Deny)],
+        ..Opts::default()
+    });
+    assert_eq!(tag(&login(&h, "example.com", None)), "failed/grant_denied");
+    assert!(h.script.calls.lock().unwrap().events.is_empty());
+}
+
+#[test]
+fn the_prompt_and_the_audit_name_the_agent() {
+    let h = harness(Opts {
+        grants: &[],
+        ..Opts::default()
+    });
+    let mut r = req(Op::Login {
+        site: "example.com".into(),
+        account: None,
+    });
+    r.client_name = "claude-code".into();
+    assert_eq!(tag(&h.broker.handle(&r)), "logged_in");
+    let shown = h.prompts.lock().unwrap().clone();
+    assert_eq!(shown.len(), 1);
+    assert!(shown[0].contains("\"claude-code\" (unverified)"), "{shown:?}");
+    let audit = std::fs::read_to_string(h.tmp.0.join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#""client":"claude-code","op":"login""#), "{audit}");
 }

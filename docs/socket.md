@@ -111,17 +111,28 @@ an unknown or collected handle is `failed/session_not_found`.
 
 ## Login flow
 
+Order: account → grant → page → pre-check → **approval** → fill. No secret is
+filled, and no password leaves the vault, before approval.
+
 1. `site_of(site)`; keys wiped → `vault_locked`.
 2. Login records whose `site_of(record.site)` matches, filtered by `account`
    (username or account_id): none → `no_account`, several → `account_ambiguous`.
-3. `grants.json`, re-read on every request: `deny` → `failed/grant_denied`;
-   `auto` → standing-grant token, no prompt; `ask` (the default) → Touch ID /
-   Mac password for up to 40 s: approved → token, denied or unavailable →
-   `denied`, no answer → `failed/timeout`. Each token's request id is recorded
-   as spent.
+3. `grants.json`, re-read on every request: `deny` → `failed/grant_denied`
+   here, before any browser.
 4. Any live session on the site closes first (one profile = one Chrome). The
    browser opens `record.site` if it is a URL, else `https://<site>/login`.
-5. The executor spends the token and fills the form. `LoggedIn` → `logged_in`;
+5. **Pre-check, before any prompt** (reads the page only, no secret): a
+   CAPTCHA → `needs_user/captcha`; a page with no password field and no text
+   field at all → `failed/field_mapping_failed`. Both end **without a Touch ID
+   prompt**, so the user is not asked to approve a login that cannot happen. A
+   page with any text field passes (a two-step sign-in shows only the email
+   field first; the fill decides).
+6. Approval: `auto` → standing-grant token, no prompt; `ask` (the default) →
+   Touch ID / Mac password naming the agent (`client_name`, unverified):
+   approved → token, denied or unavailable → `denied`, unanswered after 40 s →
+   `awaiting_approval{handle}` (see `wait`). Each token's request id is
+   recorded as spent.
+7. The executor spends the token and fills the form. `LoggedIn` → `logged_in`;
    `LoginForm`/`Rejected` → `credentials_rejected`; `Captcha` →
    `needs_user/captcha`; `Unknown` → `needs_user/unknown_page` (the session
    stays open for both `needs_user` replies, with its `session_id`).
@@ -129,10 +140,15 @@ an unknown or collected handle is `failed/session_not_found`.
    to 3 min for mail since login start − 30 s: a code is filled, a link on the
    site is opened, several codes → `needs_user/ambiguous_otp`, none →
    `failed/timeout`.
-6. Executor errors: `Fence` → `fence_blocked`, `Unreachable` →
+8. Executor errors: `Fence` → `fence_blocked`, `Unreachable` →
    `site_unreachable`, `Timeout` → `timeout`, `Mapping` →
    `field_mapping_failed`, `Token` → `grant_denied`, anything else →
    `internal` (detail on the daemon's stderr).
+
+`client_name` is the MCP client's `clientInfo.name`: from the `initialize`
+handshake, or from each request's `_meta` on the 2026-07-28 lifecycle. It is
+cleaned (control characters dropped, 64 chars max) and shown in the prompt and
+the audit log as declared, never trusted.
 
 `navigate` refuses any URL that is not http(s) on the session's registrable
 domain (`fence_blocked`) before the browser sees it. Sessions idle for 30 min

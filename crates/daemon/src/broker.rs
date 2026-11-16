@@ -26,7 +26,7 @@ use logindesk_core::limits::{
 use logindesk_core::status::{FailReason, NeedsUserReason, Status};
 use logindesk_executor::{BrowserConfig, ExecError, PageState};
 use logindesk_mail::{MailError, MailQuery, MailSource, OtpOutcome, UsedCodes, extract_otp};
-use logindesk_policy::{Grants, site_of, url_site};
+use logindesk_policy::{Grants, Tier, site_of, url_site};
 use logindesk_vault::{Keys, RecordKind, Vault};
 use serde_json::json;
 
@@ -468,6 +468,10 @@ impl Broker {
         })
     }
 
+    /// Login order: resolve the account → grant (deny stops here) → open the
+    /// page → cheap pre-check that a login form is there (no secret touched) →
+    /// approval → fill. A secret is never filled before approval; a page with
+    /// no form fails before any prompt.
     fn login(self: &Arc<Self>, client: &str, input: &str, account: Option<&str>) -> Outcome {
         let started = SystemTime::now();
         let Some(site) = site_of(input) else {
@@ -484,6 +488,24 @@ impl Broker {
             Ok(g) => g.login_tier(&site),
             Err(s) => return Outcome::new(&s, site),
         };
+        if tier == Tier::Deny {
+            return Outcome::new(&failed(FailReason::GrantDenied), site);
+        }
+        self.close_site(&site);
+        let mut browser = match self.launch(&site) {
+            Ok(b) => b,
+            Err(s) => return Outcome::new(&s, site),
+        };
+        let checked = browser
+            .navigate(&start_url(&creds.record_site))
+            .map_err(exec_status)
+            .and_then(|()| login_precheck(browser.as_mut()));
+        if let Err(s) = checked {
+            browser.close();
+            let mut out = Outcome::new(&s, site);
+            out.reply.account_id = creds.account_id.map(|a| a.to_string());
+            return out;
+        }
         let s2 = site.clone();
         self.gate(
             client,
@@ -491,23 +513,19 @@ impl Broker {
             &site,
             Vec::new(),
             tier,
-            Box::new(move |b, token, _req| b.login_run(&s2, creds, token, started)),
+            Box::new(move |b, token, _req| b.login_run(&s2, creds, browser, token, started)),
         )
     }
 
-    /// The login after approval: browser, fill, emailed code, session.
+    /// The login after approval: fill, emailed code, session.
     fn login_run(
         &self,
         site: &str,
         creds: Creds,
+        mut browser: Box<dyn Browser>,
         token: ApprovalToken,
         started: SystemTime,
     ) -> Outcome {
-        self.close_site(site);
-        let mut browser = match self.launch(site) {
-            Ok(b) => b,
-            Err(s) => return Outcome::new(&s, site),
-        };
         let status = self.drive_login(browser.as_mut(), site, creds_ref(&creds), token, started);
         let account_id = creds.account_id;
         drop(creds); // zeroizes the password now, not at end of scope
@@ -549,9 +567,6 @@ impl Broker {
         token: ApprovalToken,
         started: SystemTime,
     ) -> Status {
-        if let Err(e) = b.navigate(&start_url(c.record_site)) {
-            return exec_status(e);
-        }
         let state = match b.fill_login(site, c.username, c.password, token) {
             Ok(s) => s,
             Err(e) => return exec_status(e),
@@ -723,14 +738,38 @@ enum Poll {
 struct CredsRef<'a> {
     username: &'a str,
     password: &'a SecretString,
-    record_site: &'a str,
 }
 
 fn creds_ref(c: &Creds) -> CredsRef<'_> {
     CredsRef {
         username: &c.username,
         password: &c.password,
-        record_site: &c.record_site,
+    }
+}
+
+/// Snapshot roles that can hold a username, email or phone (not `searchbox`).
+const LOGIN_INPUT_ROLES: &[&str] = &["] textbox ", "] combobox "];
+
+/// Before any prompt, on the opened login page: is there anything to fill?
+/// Reads only the page (no secret). A password form passes; so does any text
+/// field (a two-step sign-in shows only the email first, and the fill decides).
+/// A CAPTCHA, or a page with no field at all, ends here, without a popup.
+fn login_precheck(b: &mut dyn Browser) -> Result<(), Status> {
+    match b.page_state().map_err(exec_status)? {
+        PageState::Captcha => Err(needs(NeedsUserReason::Captcha)),
+        PageState::LoginForm | PageState::Rejected => Ok(()),
+        _ => {
+            let snap = b.snapshot().map_err(exec_status)?;
+            let has_field = snap
+                .lines
+                .iter()
+                .any(|l| LOGIN_INPUT_ROLES.iter().any(|r| l.contains(r)));
+            if has_field {
+                Ok(())
+            } else {
+                Err(failed(FailReason::FieldMappingFailed))
+            }
+        }
     }
 }
 

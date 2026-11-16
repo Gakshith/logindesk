@@ -13,7 +13,8 @@ pub mod client;
 use std::path::PathBuf;
 
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::{Peer, RoleServer, ServiceExt, tool, tool_router};
+use rmcp::service::RequestContext;
+use rmcp::{RoleServer, ServiceExt, tool, tool_router};
 use schemars::JsonSchema;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -92,16 +93,36 @@ impl Logindesk {
         Self { data_dir }
     }
 
-    async fn send(&self, peer: &Peer<RoleServer>, op: Value) -> String {
-        let client = peer
-            .peer_info()
-            .map(|i| i.client_info.name.clone())
-            .unwrap_or_else(|| "unknown-mcp-client".into());
+    async fn send(&self, ctx: &RequestContext<RoleServer>, op: Value) -> String {
+        let client = client_name(ctx.client_info().map(|i| i.name).as_deref());
         let dir = self.data_dir.clone();
         let reply = tokio::task::spawn_blocking(move || client::call(&dir, &client, op))
             .await
             .unwrap_or_else(|_| client::daemon_down());
         reply.to_string()
+    }
+}
+
+/// Fallback when the client sends no `clientInfo`.
+pub const UNKNOWN_CLIENT: &str = "unknown-mcp-client";
+
+/// The agent's declared name (unverified), as shown in the approval prompt and
+/// the audit log. `clientInfo.name` comes from the MCP `initialize` handshake,
+/// or, on the 2026-07-28 lifecycle, from each request's `_meta`
+/// (`RequestContext::client_info` checks both). Control characters are
+/// dropped and the length is capped so a hostile name cannot forge prompt lines.
+pub fn client_name(declared: Option<&str>) -> String {
+    let clean: String = declared
+        .unwrap_or("")
+        .chars()
+        .filter(|c| !c.is_control())
+        .take(64)
+        .collect();
+    let clean = clean.trim();
+    if clean.is_empty() {
+        UNKNOWN_CLIENT.to_string()
+    } else {
+        clean.to_string()
     }
 }
 
@@ -113,12 +134,12 @@ impl Logindesk {
     /// on success, or a status such as denied, vault_locked, email_not_connected,
     /// needs_user (reason) or failed (reason).
     #[tool]
-    async fn login(&self, Parameters(a): Parameters<LoginArgs>, peer: Peer<RoleServer>) -> String {
+    async fn login(&self, Parameters(a): Parameters<LoginArgs>, ctx: RequestContext<RoleServer>) -> String {
         let mut op = json!({"op": "login", "site": a.site});
         if let Some(acct) = a.account {
             op["account"] = acct.into();
         }
-        self.send(&peer, op).await
+        self.send(&ctx, op).await
     }
 
     /// Create an account on a website with the user's identity (email, name) and a password
@@ -132,21 +153,21 @@ impl Logindesk {
     async fn signup(
         &self,
         Parameters(a): Parameters<SignupArgs>,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> String {
         let mut op = json!({"op": "signup", "site": a.site});
         if let Some(u) = a.url {
             op["url"] = u.into();
         }
-        self.send(&peer, op).await
+        self.send(&ctx, op).await
     }
 
     /// Wait for a login or signup that returned awaiting_approval (the user has not answered
     /// the Touch ID prompt yet). Returns the flow's final status, or awaiting_approval again
     /// if the user still has not answered. Secrets are filled by the broker and never returned.
     #[tool]
-    async fn wait(&self, Parameters(a): Parameters<WaitArgs>, peer: Peer<RoleServer>) -> String {
-        self.send(&peer, json!({"op": "wait", "handle": a.handle}))
+    async fn wait(&self, Parameters(a): Parameters<WaitArgs>, ctx: RequestContext<RoleServer>) -> String {
+        self.send(&ctx, json!({"op": "wait", "handle": a.handle}))
             .await
     }
 
@@ -156,13 +177,13 @@ impl Logindesk {
     async fn list_accounts(
         &self,
         Parameters(a): Parameters<ListAccountsArgs>,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> String {
         let mut op = json!({"op": "list_accounts"});
         if let Some(site) = a.site {
             op["site"] = site.into();
         }
-        self.send(&peer, op).await
+        self.send(&ctx, op).await
     }
 
     /// A masked view of the logged-in page: URL, title and one line per element as
@@ -172,9 +193,9 @@ impl Logindesk {
     async fn snapshot(
         &self,
         Parameters(a): Parameters<SessionArgs>,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> String {
-        self.send(&peer, json!({"op": "snapshot", "session_id": a.session_id}))
+        self.send(&ctx, json!({"op": "snapshot", "session_id": a.session_id}))
             .await
     }
 
@@ -185,10 +206,10 @@ impl Logindesk {
     async fn navigate(
         &self,
         Parameters(a): Parameters<NavigateArgs>,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> String {
         self.send(
-            &peer,
+            &ctx,
             json!({"op": "navigate", "session_id": a.session_id, "url": a.url}),
         )
         .await
@@ -197,9 +218,9 @@ impl Logindesk {
     /// Click the element with this ref from the latest snapshot. Secrets are filled by the
     /// broker and never returned.
     #[tool]
-    async fn click(&self, Parameters(a): Parameters<ClickArgs>, peer: Peer<RoleServer>) -> String {
+    async fn click(&self, Parameters(a): Parameters<ClickArgs>, ctx: RequestContext<RoleServer>) -> String {
         self.send(
-            &peer,
+            &ctx,
             json!({"op": "click", "session_id": a.session_id, "ref": a.node_ref}),
         )
         .await
@@ -211,13 +232,27 @@ impl Logindesk {
     async fn close_session(
         &self,
         Parameters(a): Parameters<SessionArgs>,
-        peer: Peer<RoleServer>,
+        ctx: RequestContext<RoleServer>,
     ) -> String {
         self.send(
-            &peer,
+            &ctx,
             json!({"op": "close_session", "session_id": a.session_id}),
         )
         .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn client_names() {
+        assert_eq!(client_name(Some("claude-code")), "claude-code");
+        assert_eq!(client_name(Some("  ")), UNKNOWN_CLIENT);
+        assert_eq!(client_name(None), UNKNOWN_CLIENT);
+        assert_eq!(client_name(Some("evil\nApprove")), "evilApprove");
+        assert_eq!(client_name(Some(&"x".repeat(200))).len(), 64);
     }
 }
 
