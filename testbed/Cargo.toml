@@ -31,3 +31,5 @@ logindesk-core = { path = "../crates/core" }
 logindesk-mail = { path = "../crates/mail" }
 logindesk-policy = { path = "../crates/policy" }
 url.workspace = true
+logindesk-daemon = { path = "../crates/daemon" }
+logindesk-vault = { path = "../crates/vault" }

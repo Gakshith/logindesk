@@ -390,3 +390,24 @@ fn plaintext_csv_export_is_0600_and_refuses_overwrite() {
     let back = logindesk_vault::parse_import_csv(std::fs::File::open(&out).unwrap()).unwrap();
     assert_eq!(back[0].secret.expose(), "CANARY-csv");
 }
+
+#[test]
+fn update_meta_keeps_the_secret_and_bumps_the_version() {
+    let dir = TempDir::new("meta");
+    let (mut v, k) = new_vault(&dir);
+    let a = v.add(&k, login("a.test", "alice", "CANARY-meta")).unwrap();
+    v.update_meta(&k, a, Some("alice+a@x.test".into()), Some("active".into()))
+        .unwrap();
+    let r = v.get(&k, a).unwrap();
+    assert_eq!(r.secret.expose(), "CANARY-meta");
+    assert_eq!(r.meta.username, "alice+a@x.test");
+    assert_eq!(r.meta.notes, "active");
+    assert_eq!(r.meta.version, 2);
+    v.update_meta(&k, a, None, Some("x".into())).unwrap();
+    let r = v.get(&k, a).unwrap();
+    assert_eq!(
+        (r.meta.username.as_str(), r.meta.notes.as_str()),
+        ("alice+a@x.test", "x")
+    );
+    assert_eq!(v.list(&k).unwrap().len(), 1);
+}

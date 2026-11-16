@@ -27,6 +27,9 @@ pub struct Grants {
     /// registrable domain → login tier.
     #[serde(default)]
     pub login: BTreeMap<String, Tier>,
+    /// registrable domain → signup tier.
+    #[serde(default)]
+    pub signup: BTreeMap<String, Tier>,
 }
 
 impl Grants {
@@ -64,6 +67,11 @@ impl Grants {
     pub fn login_tier(&self, site: &str) -> Tier {
         self.login.get(site).copied().unwrap_or(Tier::Ask)
     }
+
+    /// Tier for a signup on `site` (a registrable domain). No grant → Ask.
+    pub fn signup_tier(&self, site: &str) -> Tier {
+        self.signup.get(site).copied().unwrap_or(Tier::Ask)
+    }
 }
 
 #[cfg(test)]
@@ -82,5 +90,14 @@ mod tests {
             Grants::load(&p).unwrap().login_tier("example.com"),
             Tier::Auto
         );
+        assert_eq!(g.signup_tier("example.com"), Tier::Ask);
+        g.signup.insert("example.com".into(), Tier::Deny);
+        g.save(&p).unwrap();
+        let back = Grants::load(&p).unwrap();
+        assert_eq!(back.signup_tier("example.com"), Tier::Deny);
+        assert_eq!(back.login_tier("example.com"), Tier::Auto);
+        // An old file without the signup map still loads.
+        std::fs::write(&p, r#"{"login":{"a.com":"auto"}}"#).unwrap();
+        assert_eq!(Grants::load(&p).unwrap().signup_tier("a.com"), Tier::Ask);
     }
 }

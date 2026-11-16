@@ -208,6 +208,43 @@ impl Vault {
         Ok(())
     }
 
+    /// Replaces a record's username and/or notes, keeping its secret (version +1).
+    /// Used by signup: a record is stored `pending` before submit, then marked active.
+    pub fn update_meta(
+        &mut self,
+        keys: &Keys,
+        id: RecordId,
+        username: Option<String>,
+        notes: Option<String>,
+    ) -> Result<()> {
+        let tx = self.store.write_tx()?;
+        let mut manifest = read_manifest(&tx, keys)?;
+        let old = read_record(&tx, keys, &manifest, &id.0)?;
+        let entry = ManifestEntry {
+            id: id.0,
+            kind: old.meta.kind.code(),
+            version: old.meta.version + 1,
+        };
+        let fields = PayloadFields {
+            created_at: old.meta.created_at,
+            updated_at: now_unix(),
+            site: old.meta.site,
+            username: username.unwrap_or(old.meta.username),
+            created_by: old.meta.created_by,
+            notes: notes.unwrap_or(old.meta.notes),
+        };
+        write_record(
+            &tx,
+            keys,
+            &mut manifest,
+            entry,
+            &fields,
+            old.secret.expose().as_bytes(),
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Reads and decrypts one record.
     pub fn get(&self, keys: &Keys, id: RecordId) -> Result<Record> {
         let conn = self.store.conn();

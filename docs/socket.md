@@ -17,7 +17,8 @@ All in the data dir, the folder that holds the vault
 | `daemon.sock` | 0600 | the Unix socket |
 | `client.token` | 0600 | 32 lowercase hex chars, fresh on every daemon start |
 | `audit.jsonl` | 0600 | hash-chained log, see below |
-| `grants.json` | 0600 | per-site login tier (written by `logindesk grant`) |
+| `grants.json` | 0600 | per-site `login` and `signup` tiers (written by `logindesk grant`) |
+| `identity.json` | 0600 | `{"email","name"?}` signups are made as (`logindesk identity set`) |
 | `mail.json` | 0600 | `{"kind":"mailpit"\|"outbox","url":"http://127.0.0.1:…"}`; absent = no mailbox |
 | `profiles/<site>/` | | one Chrome profile per registrable domain |
 
@@ -48,6 +49,8 @@ the socket; a stale socket file is removed.
 | `snapshot` | `session_id` | `ok` + `data = {url, title, lines[]}` |
 | `navigate` | `session_id`, `url` | `ok` + `data.url` |
 | `click` | `session_id`, `ref` (u64 from a snapshot line) | `ok` + `data.url` |
+| `signup` | `site`, `url`? (signup page on the site) | `created` + `account_id`, `session_id`, `data.email_used` |
+| `wait` | `handle` | the flow's final status, or `awaiting_approval` again |
 | `close_session` | `session_id` | `ok` |
 | `lock` | | `ok` (the daemon drops its vault keys) |
 | `ping` | | `ok` |
@@ -70,8 +73,41 @@ written to the audit log, clipped to 64 chars.
 
 `status` is `Status::wire()`; `reason` is the `NeedsUserReason` /
 `FailReason` tag. Optional fields are omitted when empty: `reason`,
-`session_id`, `account_id`, `message` (fixed text only, never page text),
-`data` (snapshot lines, a URL, or the account list only).
+`session_id`, `account_id`, `handle` (for `wait`), `message` (fixed text
+only, never page text), `data` (snapshot lines, a URL, the account list, or
+`email_used`).
+
+## Approvals and `wait`
+
+`login` and `signup` pass one gate. `deny` → `failed/grant_denied`; `auto` →
+standing-grant token, no prompt; `ask` → Touch ID / Mac password on its own
+thread, open up to 10 min. The call blocks up to 40 s for the answer. Answered:
+it waits for the flow and returns its status. Not answered: it returns
+`{"status":"awaiting_approval","handle":"<32 hex>"}` and the flow continues
+when the user answers; `wait{handle}` blocks up to another 40 s and returns
+the final status (or `awaiting_approval` again). A handle is collected once;
+an unknown or collected handle is `failed/session_not_found`.
+
+## Signup flow
+
+1. Refused before any browser: a blocklisted site (banks, government, health,
+   payments, email providers → `failed/grant_denied`), a `url` off the site
+   (`fence_blocked`), no `identity.json` (`failed/internal` + how to set it),
+   10 signups in the last 24 h (`failed/rate_limited`), the `signup` grant.
+2. Approval `shares` = `["email", "name"?]`.
+3. Browser on `url` or `https://<site>/signup`. A password is generated from
+   the form's `passwordrules`, else 20 chars of upper/lower/digits/symbols.
+4. **The record is stored `pending` before submit** (`created_by: "signup"`,
+   site = `<origin>/login`, username = `you+<label>@domain`).
+5. The executor fills email, name and every password field, never ticks a
+   checkbox (a required unticked one → `needs_user/unknown_page`, unsubmitted),
+   and submits. Plus-address refused → once more with the plain address.
+6. A code or "check your email" page → the mailbox: a code is filled, a link
+   on the site is opened.
+7. Signed in (or at the login form) → record `active`, an `account_created`
+   audit line, `created`. Rejected → record deleted. CAPTCHA →
+   `needs_user/captcha`. Errors before submit (fence, mapping) delete the
+   record; anything after keeps it `pending` (recoverable).
 
 ## Login flow
 

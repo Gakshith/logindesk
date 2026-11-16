@@ -27,6 +27,17 @@ pub trait Browser: Send {
     ) -> Result<PageState, ExecError>;
     /// Fill an emailed code.
     fn fill_otp(&mut self, site: &str, code: &SecretString) -> Result<PageState, ExecError>;
+    /// The signup form's `passwordrules`, if any.
+    fn password_rules(&mut self, site: &str) -> Result<Option<String>, ExecError>;
+    /// Spend the token and fill + submit the signup form (never ticks a checkbox).
+    fn fill_signup(
+        &mut self,
+        site: &str,
+        email: &str,
+        name: &str,
+        password: &SecretString,
+        token: ApprovalToken,
+    ) -> Result<PageState, ExecError>;
     /// Close the browser.
     fn close(self: Box<Self>);
 }
@@ -74,6 +85,19 @@ impl Browser for Session {
     }
     fn fill_otp(&mut self, site: &str, code: &SecretString) -> Result<PageState, ExecError> {
         Session::fill_otp(self, site, code)
+    }
+    fn password_rules(&mut self, site: &str) -> Result<Option<String>, ExecError> {
+        Session::password_rules(self, site)
+    }
+    fn fill_signup(
+        &mut self,
+        site: &str,
+        email: &str,
+        name: &str,
+        password: &SecretString,
+        token: ApprovalToken,
+    ) -> Result<PageState, ExecError> {
+        Session::fill_signup(self, site, email, name, password, token)
     }
     fn close(self: Box<Self>) {
         Session::close(*self);

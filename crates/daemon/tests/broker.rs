@@ -2,6 +2,7 @@
 //! mailbox. The real Chrome end to end runs after the lanes merge.
 #![allow(clippy::unwrap_used)] // test code: a panic is a test failure
 
+use std::collections::VecDeque;
 use std::io::{Read, Write};
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::net::UnixStream;
@@ -13,9 +14,11 @@ use std::time::{Duration, Instant};
 use logindesk_approver::{
     Action, ApprovalOutcome, ApprovalRequest, ApprovalToken, Approver, Scripted,
 };
+use logindesk_core::Secret;
 use logindesk_core::SecretString;
 use logindesk_daemon::audit;
 use logindesk_daemon::browser::{Browser, Launcher};
+use logindesk_daemon::identity::Identity;
 use logindesk_daemon::mailcfg::MailProvider;
 use logindesk_daemon::proto::{MAX_FRAME, Op, Reply, Request, read_frame, write_frame};
 use logindesk_daemon::server::{self, Server};
@@ -38,11 +41,19 @@ struct Calls {
     navigations: Vec<String>,
     fills: Vec<(String, String)>,
     profile_dirs: Vec<PathBuf>,
+    signup_fills: Vec<(String, String)>,
+    otp_codes: Vec<String>,
+    pending_seen_before_submit: usize,
 }
 
-#[derive(Debug)]
+/// Called with the generated password inside `fill_signup`, before "submit".
+type Probe = Box<dyn Fn(&str) -> bool + Send + Sync>;
+
 struct Script {
     after_fill: Result<PageState, ExecError>,
+    signup_states: Mutex<VecDeque<Result<PageState, ExecError>>>,
+    rules: Option<String>,
+    probe: Mutex<Option<Probe>>,
     calls: Mutex<Calls>,
 }
 
@@ -110,8 +121,46 @@ impl Browser for FakeBrowser {
             .push((site.into(), username.into()));
         self.script.after_fill
     }
-    fn fill_otp(&mut self, _site: &str, _code: &SecretString) -> Result<PageState, ExecError> {
+    fn fill_otp(&mut self, _site: &str, code: &SecretString) -> Result<PageState, ExecError> {
+        self.script
+            .calls
+            .lock()
+            .unwrap()
+            .otp_codes
+            .push(code.expose().clone());
         Ok(PageState::LoggedIn)
+    }
+    fn password_rules(&mut self, _site: &str) -> Result<Option<String>, ExecError> {
+        Ok(self.script.rules.clone())
+    }
+    fn fill_signup(
+        &mut self,
+        site: &str,
+        email: &str,
+        name: &str,
+        password: &SecretString,
+        token: ApprovalToken,
+    ) -> Result<PageState, ExecError> {
+        token
+            .spend(Action::Signup, site)
+            .map_err(|_| ExecError::Token)?;
+        if let Some(p) = self.script.probe.lock().unwrap().as_ref()
+            && p(password.expose())
+        {
+            self.script.calls.lock().unwrap().pending_seen_before_submit += 1;
+        }
+        self.script
+            .calls
+            .lock()
+            .unwrap()
+            .signup_fills
+            .push((email.into(), name.into()));
+        self.script
+            .signup_states
+            .lock()
+            .unwrap()
+            .pop_front()
+            .unwrap_or(Ok(PageState::LoggedIn))
     }
     fn close(self: Box<Self>) {
         self.script.calls.lock().unwrap().closes += 1;
@@ -129,6 +178,17 @@ impl Launcher for FakeLauncher {
             script: Arc::clone(&self.0),
             url: String::new(),
         }))
+    }
+}
+
+/// Answers after a delay (a user slow to touch the sensor).
+struct Slow(Duration, ApprovalOutcome, Arc<AtomicUsize>);
+
+impl Approver for Slow {
+    fn approve(&self, _req: &ApprovalRequest, _limit: Duration) -> ApprovalOutcome {
+        self.2.fetch_add(1, Ordering::SeqCst);
+        std::thread::sleep(self.0);
+        self.1
     }
 }
 
@@ -150,14 +210,27 @@ enum MailMode {
     None,
     NotConnected,
     Empty,
+    /// One verification mail from the site with this code.
+    Code(&'static str),
 }
 
 struct FakeMailbox(MailMode);
 
 impl MailSource for FakeMailbox {
-    fn search(&self, _q: &MailQuery) -> Result<Vec<RawMessage>, MailError> {
+    fn search(&self, q: &MailQuery) -> Result<Vec<RawMessage>, MailError> {
         match self.0 {
             MailMode::NotConnected => Err(MailError::NotConnected),
+            MailMode::Code(c) => Ok(vec![RawMessage {
+                id: "m1".into(),
+                received: std::time::SystemTime::now(),
+                bytes: Secret::new(
+                    format!(
+                        "From: <no-reply@{}>\r\nSubject: Verify your account\r\nContent-Type: text/plain\r\n\r\nYour verification code is {c}.\r\n",
+                        q.site
+                    )
+                    .into_bytes(),
+                ),
+            }]),
             _ => Ok(Vec::new()),
         }
     }
@@ -205,6 +278,14 @@ struct H {
 }
 
 struct Opts {
+    signup_states: Vec<Result<PageState, ExecError>>,
+    identity: Option<(&'static str, &'static str)>,
+    signup_grants: &'static [(&'static str, Tier)],
+    rules: Option<&'static str>,
+    signups_per_day: usize,
+    /// Overrides `approve` with a slow approver.
+    slow: Option<(Duration, ApprovalOutcome)>,
+    approval_in_call: Duration,
     approve: ApprovalOutcome,
     after_fill: Result<PageState, ExecError>,
     mail: MailMode,
@@ -222,6 +303,13 @@ impl Default for Opts {
             accounts: &[("example.com", "alice@example.com")],
             grants: &[("example.com", Tier::Auto)],
             lock_after: None,
+            signup_states: Vec::new(),
+            identity: Some(("you@mail.test", "Ann Example")),
+            signup_grants: &[("example.com", Tier::Auto)],
+            rules: None,
+            signups_per_day: 10,
+            slow: None,
+            approval_in_call: Duration::from_secs(5),
         }
     }
 }
@@ -266,21 +354,52 @@ fn harness(o: Opts) -> H {
     cfg.otp_poll_every = Duration::from_millis(10);
     cfg.otp_wait_max = Duration::from_millis(60);
     cfg.lock_after = o.lock_after;
+    cfg.signups_per_day = o.signups_per_day;
+    cfg.approval_in_call = o.approval_in_call;
     let mut g = Grants::default();
     for (s, t) in o.grants {
         g.login.insert((*s).into(), *t);
     }
+    for (s, t) in o.signup_grants {
+        g.signup.insert((*s).into(), *t);
+    }
     g.save(&cfg.grants_path).unwrap();
+    if let Some((email, name)) = o.identity {
+        Identity {
+            email: email.into(),
+            name: Some(name.into()),
+        }
+        .save(&tmp.0)
+        .unwrap();
+    }
+    // Opens the vault file from disk (a second handle) and looks for a pending
+    // record holding exactly this password.
+    let vault_path = tmp.0.join("vault.sqlite");
+    let probe: Probe = Box::new(move |pw: &str| {
+        let v = Vault::open(&vault_path).unwrap();
+        let k = v.unlock(&SecretString::new(PW.into())).unwrap();
+        v.records(&k)
+            .unwrap()
+            .iter()
+            .any(|r| r.meta.notes == "pending" && r.secret.expose() == pw)
+    });
     let script = Arc::new(Script {
         after_fill: o.after_fill,
+        signup_states: Mutex::new(o.signup_states.into()),
+        rules: o.rules.map(Into::into),
+        probe: Mutex::new(Some(probe)),
         calls: Mutex::new(Calls::default()),
     });
     let asked = Arc::new(AtomicUsize::new(0));
-    let deps = Deps {
-        approver: Box::new(Counting {
+    let approver: Box<dyn Approver> = match o.slow {
+        Some((d, outcome)) => Box::new(Slow(d, outcome, Arc::clone(&asked))),
+        None => Box::new(Counting {
             inner: Scripted(o.approve),
             asked: Arc::clone(&asked),
         }),
+    };
+    let deps = Deps {
+        approver,
         launcher: Box::new(FakeLauncher(Arc::clone(&script))),
         mail: Box::new(FakeMail(o.mail)),
     };
@@ -757,4 +876,384 @@ fn socket_permissions_token_and_frame_limit() {
     let r: Reply = serde_json::from_slice(&read_frame(&mut s).unwrap().unwrap()).unwrap();
     assert_eq!(tag(&r), "failed/internal");
     assert_eq!(r.message.as_deref(), Some("request is not JSON"));
+}
+
+// ---------- signup ----------
+
+fn signup(h: &H, site: &str, url: Option<&str>) -> Reply {
+    h.broker.handle(&req(Op::Signup {
+        site: site.into(),
+        url: url.map(Into::into),
+    }))
+}
+
+/// (username, notes, created_by) of every login record created by signup.
+fn signup_records(h: &H) -> Vec<(String, String)> {
+    let v = Vault::open(&h.tmp.0.join("vault.sqlite")).unwrap();
+    let k = v.unlock(&SecretString::new(PW.into())).unwrap();
+    v.list(&k)
+        .unwrap()
+        .into_iter()
+        .filter(|m| m.created_by == "signup")
+        .map(|m| (m.username, m.notes))
+        .collect()
+}
+
+#[test]
+fn signup_creates_verifies_by_email_and_marks_active() {
+    let h = harness(Opts {
+        signup_states: vec![Ok(PageState::NeedsOtp)],
+        mail: MailMode::Code("482913"),
+        rules: Some("minlength: 12; maxlength: 16; required: digit; allowed: lower"),
+        ..Opts::default()
+    });
+    let r = signup(&h, "https://www.example.com/", None);
+    assert_eq!(tag(&r), "created", "{r:?}");
+    assert_eq!(
+        h.asked.load(Ordering::SeqCst),
+        0,
+        "auto signup grant: no prompt"
+    );
+    let d = r.data.clone().unwrap();
+    assert_eq!(d["email_used"], "you+example@mail.test");
+    assert!(r.account_id.is_some() && r.session_id.is_some());
+    assert_eq!(h.broker.session_count(), 1);
+
+    let c = h.script.calls.lock().unwrap();
+    assert_eq!(
+        c.navigations,
+        vec!["https://example.com/signup".to_string()]
+    );
+    assert_eq!(
+        c.signup_fills,
+        vec![(
+            "you+example@mail.test".to_string(),
+            "Ann Example".to_string()
+        )]
+    );
+    assert_eq!(c.otp_codes, vec!["482913".to_string()]);
+    assert_eq!(
+        c.pending_seen_before_submit, 1,
+        "pending record on disk before submit"
+    );
+    drop(c);
+
+    assert_eq!(
+        signup_records(&h),
+        vec![("you+example@mail.test".to_string(), "active".to_string())]
+    );
+    // The generated password honoured passwordrules and is what the vault holds.
+    let v = Vault::open(&h.tmp.0.join("vault.sqlite")).unwrap();
+    let k = v.unlock(&SecretString::new(PW.into())).unwrap();
+    let rec = v
+        .records(&k)
+        .unwrap()
+        .into_iter()
+        .find(|r| r.meta.created_by == "signup")
+        .unwrap();
+    let pw = rec.secret.expose();
+    assert!((12..=16).contains(&pw.len()), "{pw}");
+    assert!(
+        pw.chars()
+            .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit())
+    );
+    assert!(pw.chars().any(|c| c.is_ascii_digit()));
+    // The new account shows in list_accounts and is no longer pending.
+    let list = h.broker.handle(&req(Op::ListAccounts {
+        site: Some("example.com".into()),
+    }));
+    let accts = list.data.unwrap()["accounts"].as_array().unwrap().clone();
+    assert!(
+        accts
+            .iter()
+            .any(|a| a["username"] == "you+example@mail.test" && a.get("pending").is_none())
+    );
+
+    let audit = std::fs::read_to_string(h.tmp.0.join("audit.jsonl")).unwrap();
+    assert!(audit.contains(r#""op":"account_created","site":"example.com","status":"created""#));
+    assert!(audit.contains(r#""op":"signup","site":"example.com","status":"created""#));
+    assert!(!audit.contains(pw));
+    assert_eq!(audit::verify(&h.tmp.0.join("audit.jsonl")).unwrap().0, 3);
+}
+
+#[test]
+fn plus_address_refused_retries_with_plain_address() {
+    let h = harness(Opts {
+        signup_states: vec![Ok(PageState::SignupForm), Ok(PageState::LoggedIn)],
+        ..Opts::default()
+    });
+    let r = signup(&h, "example.com", None);
+    assert_eq!(tag(&r), "created");
+    assert_eq!(r.data.unwrap()["email_used"], "you@mail.test");
+    let c = h.script.calls.lock().unwrap();
+    let emails: Vec<&str> = c.signup_fills.iter().map(|(e, _)| e.as_str()).collect();
+    assert_eq!(emails, ["you+example@mail.test", "you@mail.test"]);
+    drop(c);
+    assert_eq!(
+        signup_records(&h),
+        vec![("you@mail.test".to_string(), "active".to_string())]
+    );
+}
+
+/// (page states, mail, want, record kept pending?, session kept?)
+type SignupCase = (
+    Vec<Result<PageState, ExecError>>,
+    MailMode,
+    &'static str,
+    bool,
+    bool,
+);
+
+#[test]
+fn signup_statuses_and_what_happens_to_the_pending_record() {
+    let cases: Vec<SignupCase> = vec![
+        (
+            vec![Ok(PageState::Captcha)],
+            MailMode::None,
+            "needs_user/captcha",
+            true,
+            true,
+        ),
+        (
+            vec![Ok(PageState::NeedsConsent)],
+            MailMode::None,
+            "needs_user/unknown_page",
+            true,
+            true,
+        ),
+        (
+            vec![Ok(PageState::Rejected), Ok(PageState::Rejected)],
+            MailMode::None,
+            "failed/credentials_rejected",
+            false,
+            false,
+        ),
+        (
+            vec![Err(ExecError::Mapping)],
+            MailMode::None,
+            "failed/field_mapping_failed",
+            false,
+            false,
+        ),
+        (
+            vec![Err(ExecError::Fence)],
+            MailMode::None,
+            "failed/fence_blocked",
+            false,
+            false,
+        ),
+        // A timeout after submit: the site may have the account; keep the password.
+        (
+            vec![Err(ExecError::Timeout)],
+            MailMode::None,
+            "failed/timeout",
+            true,
+            false,
+        ),
+        (
+            vec![Ok(PageState::VerifyEmail)],
+            MailMode::None,
+            "email_not_connected",
+            true,
+            false,
+        ),
+        (
+            vec![Ok(PageState::NeedsOtp)],
+            MailMode::Empty,
+            "failed/timeout",
+            true,
+            false,
+        ),
+    ];
+    for (states, mail, want, kept, session) in cases {
+        let h = harness(Opts {
+            signup_states: states,
+            mail,
+            ..Opts::default()
+        });
+        let r = signup(&h, "example.com", None);
+        assert_eq!(tag(&r), want);
+        let recs = signup_records(&h);
+        if kept {
+            assert_eq!(recs.len(), 1, "{want}");
+            assert_eq!(recs[0].1, "pending", "{want}");
+            assert!(r.account_id.is_some(), "{want}");
+        } else {
+            assert!(recs.is_empty(), "{want}: {recs:?}");
+        }
+        assert_eq!(h.broker.session_count(), usize::from(session), "{want}");
+        assert_eq!(r.session_id.is_some(), session, "{want}");
+    }
+}
+
+#[test]
+fn signup_refusals_happen_before_any_browser() {
+    let h = harness(Opts {
+        signup_grants: &[("example.com", Tier::Deny)],
+        ..Opts::default()
+    });
+    assert_eq!(tag(&signup(&h, "example.com", None)), "failed/grant_denied");
+    let r = signup(&h, "https://www.paypal.com/signup", None);
+    assert_eq!(tag(&r), "failed/grant_denied");
+    assert!(r.message.unwrap().contains("never signs up"));
+    assert_eq!(tag(&signup(&h, "irs.gov", None)), "failed/grant_denied");
+    // A signup URL off the site is fenced.
+    let h2 = harness(Opts::default());
+    let r = signup(&h2, "example.com", Some("https://evil.com/signup"));
+    assert_eq!(tag(&r), "failed/fence_blocked");
+    let r = signup(&h2, "example.com", Some("javascript:alert(1)"));
+    assert_eq!(tag(&r), "failed/fence_blocked");
+    for hh in [&h, &h2] {
+        assert_eq!(hh.script.calls.lock().unwrap().launches, 0);
+    }
+    // No identity yet.
+    let h3 = harness(Opts {
+        identity: None,
+        ..Opts::default()
+    });
+    let r = signup(&h3, "example.com", None);
+    assert_eq!(tag(&r), "failed/internal");
+    assert!(r.message.unwrap().contains("logindesk identity set"));
+    // Ask tier + no.
+    let h4 = harness(Opts {
+        signup_grants: &[],
+        approve: ApprovalOutcome::Denied,
+        ..Opts::default()
+    });
+    assert_eq!(tag(&signup(&h4, "example.com", None)), "denied");
+    assert_eq!(h4.asked.load(Ordering::SeqCst), 1);
+    assert!(signup_records(&h4).is_empty());
+}
+
+#[test]
+fn signup_daily_limit() {
+    let h = harness(Opts {
+        signups_per_day: 2,
+        ..Opts::default()
+    });
+    assert_eq!(tag(&signup(&h, "example.com", None)), "created");
+    assert_eq!(tag(&signup(&h, "example.com", None)), "created");
+    assert_eq!(tag(&signup(&h, "example.com", None)), "failed/rate_limited");
+    assert_eq!(h.script.calls.lock().unwrap().launches, 2);
+}
+
+#[test]
+fn signup_url_sets_start_page_and_login_page() {
+    let h = harness(Opts::default());
+    let r = signup(
+        &h,
+        "example.com",
+        Some("https://app.example.com/register?x=1"),
+    );
+    assert_eq!(tag(&r), "created");
+    assert_eq!(
+        h.script.calls.lock().unwrap().navigations,
+        vec!["https://app.example.com/register?x=1".to_string()]
+    );
+    let v = Vault::open(&h.tmp.0.join("vault.sqlite")).unwrap();
+    let k = v.unlock(&SecretString::new(PW.into())).unwrap();
+    let m = v
+        .list(&k)
+        .unwrap()
+        .into_iter()
+        .find(|m| m.created_by == "signup")
+        .unwrap();
+    assert_eq!(m.site, "https://app.example.com/login");
+}
+
+// ---------- approval wait handle ----------
+
+#[test]
+fn unanswered_prompt_returns_a_handle_and_wait_collects_the_result() {
+    let h = harness(Opts {
+        grants: &[],
+        slow: Some((Duration::from_millis(400), ApprovalOutcome::Approved)),
+        approval_in_call: Duration::from_millis(50),
+        ..Opts::default()
+    });
+    let t = Instant::now();
+    let r = login(&h, "example.com", None);
+    assert!(
+        t.elapsed() < Duration::from_millis(350),
+        "returned before the answer"
+    );
+    assert_eq!(tag(&r), "awaiting_approval");
+    let handle = r.handle.clone().unwrap();
+    assert_eq!(handle.len(), 32);
+    assert_eq!(h.broker.pending_count(), 1);
+    assert_eq!(
+        h.script.calls.lock().unwrap().launches,
+        0,
+        "no browser before a yes"
+    );
+
+    // Still unanswered: wait returns the same handle state again.
+    let again = h.broker.handle(&req(Op::Wait {
+        handle: handle.clone(),
+    }));
+    assert_eq!(tag(&again), "awaiting_approval");
+
+    // Eventually answered: wait returns the flow's final status.
+    let mut done = again;
+    let start = Instant::now();
+    while done.status == "awaiting_approval" {
+        assert!(start.elapsed() < Duration::from_secs(5));
+        done = h.broker.handle(&req(Op::Wait {
+            handle: handle.clone(),
+        }));
+    }
+    assert_eq!(tag(&done), "logged_in");
+    assert!(done.session_id.is_some());
+    assert_eq!(h.broker.pending_count(), 0);
+    // A handle is collected once.
+    let r = h.broker.handle(&req(Op::Wait { handle }));
+    assert_eq!(tag(&r), "failed/session_not_found");
+    let r = h.broker.handle(&req(Op::Wait {
+        handle: "nope".into(),
+    }));
+    assert_eq!(tag(&r), "failed/session_not_found");
+}
+
+#[test]
+fn wait_handle_carries_a_denial_and_a_signup() {
+    let h = harness(Opts {
+        grants: &[],
+        slow: Some((Duration::from_millis(200), ApprovalOutcome::Denied)),
+        approval_in_call: Duration::from_millis(20),
+        ..Opts::default()
+    });
+    let r = login(&h, "example.com", None);
+    assert_eq!(tag(&r), "awaiting_approval");
+    let mut r2 = h.broker.handle(&req(Op::Wait {
+        handle: r.handle.clone().unwrap(),
+    }));
+    while r2.status == "awaiting_approval" {
+        r2 = h.broker.handle(&req(Op::Wait {
+            handle: r.handle.clone().unwrap(),
+        }));
+    }
+    assert_eq!(tag(&r2), "denied");
+
+    let h = harness(Opts {
+        signup_grants: &[],
+        slow: Some((Duration::from_millis(200), ApprovalOutcome::Approved)),
+        approval_in_call: Duration::from_millis(20),
+        ..Opts::default()
+    });
+    let r = signup(&h, "example.com", None);
+    assert_eq!(tag(&r), "awaiting_approval");
+    let hd = r.handle.unwrap();
+    let mut r2 = h.broker.handle(&req(Op::Wait { handle: hd.clone() }));
+    while r2.status == "awaiting_approval" {
+        r2 = h.broker.handle(&req(Op::Wait { handle: hd.clone() }));
+    }
+    assert_eq!(tag(&r2), "created");
+    // An answer within the in-call window needs no handle at all.
+    let h = harness(Opts {
+        grants: &[],
+        slow: Some((Duration::from_millis(30), ApprovalOutcome::Approved)),
+        approval_in_call: Duration::from_secs(5),
+        ..Opts::default()
+    });
+    assert_eq!(tag(&login(&h, "example.com", None)), "logged_in");
 }

@@ -4,20 +4,29 @@
 //! Locking: `state` is held only for short, in-memory work. The approval
 //! prompt, browser launch, page loads and the OTP wait run without it. Each
 //! browser has its own lock, so one slow page does not stall other sessions.
+//!
+//! Every login and signup passes the approval [`gate`]: `auto` and `deny`
+//! answer at once; `ask` prompts on its own thread so an unanswered prompt
+//! becomes an `awaiting_approval` handle the agent can `wait` on.
+
+mod gate;
+mod signup;
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant, SystemTime};
 
-use logindesk_approver::{Action, ApprovalOutcome, ApprovalRequest, ApprovalToken, Approver};
+use logindesk_approver::{Action, ApprovalToken, Approver};
 use logindesk_core::SecretString;
-use logindesk_core::ids::{AccountId, RequestId, SessionId};
-use logindesk_core::limits::{APPROVAL_IN_CALL, OTP_POLL_EVERY, OTP_WAIT_MAX, SESSION_IDLE_CLOSE};
+use logindesk_core::ids::{AccountId, Handle, RequestId, SessionId};
+use logindesk_core::limits::{
+    APPROVAL_IN_CALL, APPROVAL_WAIT_MAX, OTP_POLL_EVERY, OTP_WAIT_MAX, SESSION_IDLE_CLOSE,
+};
 use logindesk_core::status::{FailReason, NeedsUserReason, Status};
 use logindesk_executor::{BrowserConfig, ExecError, PageState};
 use logindesk_mail::{MailError, MailQuery, MailSource, OtpOutcome, UsedCodes, extract_otp};
-use logindesk_policy::{Grants, Tier, site_of, url_site};
+use logindesk_policy::{Grants, site_of, url_site};
 use logindesk_vault::{Keys, RecordKind, Vault};
 use serde_json::json;
 
@@ -48,6 +57,12 @@ pub struct Config {
     pub otp_wait_max: Duration,
     /// Idle browser sessions close after this.
     pub idle_close: Duration,
+    /// How long a call blocks on an `ask` prompt before returning a handle.
+    pub approval_in_call: Duration,
+    /// How long an `ask` prompt stays open in all.
+    pub approval_wait_max: Duration,
+    /// Most signups in any 24 hours.
+    pub signups_per_day: usize,
 }
 
 impl Config {
@@ -66,6 +81,9 @@ impl Config {
             otp_poll_every: OTP_POLL_EVERY,
             otp_wait_max: OTP_WAIT_MAX,
             idle_close: SESSION_IDLE_CLOSE,
+            approval_in_call: APPROVAL_IN_CALL,
+            approval_wait_max: APPROVAL_WAIT_MAX,
+            signups_per_day: signup::SIGNUPS_PER_DAY,
         }
     }
 }
@@ -123,6 +141,7 @@ pub struct Broker {
     state: Mutex<State>,
     used_codes: Mutex<UsedCodes>,
     audit: Mutex<Audit>,
+    pending: Mutex<HashMap<Handle, Arc<gate::Pending>>>,
 }
 
 impl std::fmt::Debug for Broker {
@@ -217,6 +236,7 @@ impl Broker {
             }),
             used_codes: Mutex::new(UsedCodes::default()),
             audit: Mutex::new(audit),
+            pending: Mutex::new(HashMap::new()),
         })
     }
 
@@ -231,7 +251,7 @@ impl Broker {
     }
 
     /// Handle one parsed, already-authenticated request.
-    pub fn handle(&self, req: &Request) -> Reply {
+    pub fn handle(self: &Arc<Self>, req: &Request) -> Reply {
         lock(&self.state).last_request = Instant::now();
         let out = match &req.op {
             Op::Ping => Outcome::new(&Status::Ok, ""),
@@ -248,6 +268,8 @@ impl Broker {
                 node_ref,
             } => self.click(session_id, *node_ref),
             Op::CloseSession { session_id } => self.close_session(session_id),
+            Op::Signup { site, url } => self.signup(&req.client_name, site, url.as_deref()),
+            Op::Wait { handle } => self.wait(handle),
         };
         self.audit(&req.client_name, req.op.name(), &out.site, &out.reply);
         out.reply
@@ -305,6 +327,7 @@ impl Broker {
         for s in idle {
             s.close();
         }
+        self.purge_pending(now);
     }
 
     /// Close every session (daemon shutdown).
@@ -355,11 +378,15 @@ impl Broker {
                 if want.as_deref().is_some_and(|w| w != d) {
                     return None;
                 }
-                Some(json!({
+                let mut row = json!({
                     "account_id": account_id(&m.id)?.to_string(),
                     "site": d,
                     "username": m.username,
-                }))
+                });
+                if m.notes == signup::PENDING {
+                    row["pending"] = true.into();
+                }
+                Some(row)
             })
             .collect();
         rows.sort_by_key(ToString::to_string);
@@ -402,39 +429,12 @@ impl Broker {
         }
     }
 
-    /// Grant check and, for `ask`, the prompt. Re-reads grants.json each time.
-    fn approve(&self, client: &str, site: &str) -> Result<ApprovalToken, Status> {
-        let grants = Grants::load(&self.cfg.grants_path).map_err(|e| {
+    /// grants.json, re-read on every request.
+    fn grants(&self) -> Result<Grants, Status> {
+        Grants::load(&self.cfg.grants_path).map_err(|e| {
             eprintln!("logindesk: grants.json unreadable: {e}");
             failed(FailReason::Internal)
-        })?;
-        let req = ApprovalRequest {
-            request_id: RequestId::random(),
-            client_name: client.to_string(),
-            action: Action::Login,
-            site: site.to_string(),
-            shares: Vec::new(),
-        };
-        let token = match grants.login_tier(site) {
-            Tier::Deny => return Err(failed(FailReason::GrantDenied)),
-            Tier::Auto => ApprovalToken::from_standing_grant(&req),
-            Tier::Ask => {
-                let outcome = self.deps.approver.approve(&req, APPROVAL_IN_CALL);
-                match outcome {
-                    ApprovalOutcome::Approved => ApprovalToken::from_outcome(&req, outcome)
-                        .ok_or(failed(FailReason::Internal))?,
-                    ApprovalOutcome::Denied | ApprovalOutcome::Unavailable => {
-                        return Err(Status::Denied);
-                    }
-                    ApprovalOutcome::TimedOut => return Err(failed(FailReason::Timeout)),
-                }
-            }
-        };
-        // Single use across the socket too, not only in-process.
-        if !lock(&self.state).spent.insert(token.request_id()) {
-            return Err(failed(FailReason::GrantDenied));
-        }
-        Ok(token)
+        })
     }
 
     /// Close any live session for `site` (one profile dir = one Chrome).
@@ -468,7 +468,7 @@ impl Broker {
         })
     }
 
-    fn login(&self, client: &str, input: &str, account: Option<&str>) -> Outcome {
+    fn login(self: &Arc<Self>, client: &str, input: &str, account: Option<&str>) -> Outcome {
         let started = SystemTime::now();
         let Some(site) = site_of(input) else {
             return Outcome::new(&failed(FailReason::NoAccount), "");
@@ -480,40 +480,64 @@ impl Broker {
             Ok(c) => c,
             Err(s) => return Outcome::new(&s, site),
         };
-        let token = match self.approve(client, &site) {
-            Ok(t) => t,
+        let tier = match self.grants() {
+            Ok(g) => g.login_tier(&site),
             Err(s) => return Outcome::new(&s, site),
         };
-        self.close_site(&site);
-        let mut browser = match self.launch(&site) {
+        let s2 = site.clone();
+        self.gate(
+            client,
+            Action::Login,
+            &site,
+            Vec::new(),
+            tier,
+            Box::new(move |b, token, _req| b.login_run(&s2, creds, token, started)),
+        )
+    }
+
+    /// The login after approval: browser, fill, emailed code, session.
+    fn login_run(
+        &self,
+        site: &str,
+        creds: Creds,
+        token: ApprovalToken,
+        started: SystemTime,
+    ) -> Outcome {
+        self.close_site(site);
+        let mut browser = match self.launch(site) {
             Ok(b) => b,
             Err(s) => return Outcome::new(&s, site),
         };
-        let status = self.drive_login(browser.as_mut(), &site, creds_ref(&creds), token, started);
+        let status = self.drive_login(browser.as_mut(), site, creds_ref(&creds), token, started);
         let account_id = creds.account_id;
         drop(creds); // zeroizes the password now, not at end of scope
 
         let keep = matches!(status, Status::LoggedIn { .. } | Status::NeedsUser { .. });
-        let mut out = Outcome::new(&status, site.clone());
+        let mut out = Outcome::new(&status, site);
         if keep {
             let id = match &status {
                 Status::LoggedIn { session_id } => *session_id,
                 _ => SessionId::random(),
             };
-            let slot = Arc::new(Slot {
-                site: site.clone(),
-                browser: Mutex::new(Some(browser)),
-                last_used: Mutex::new(Instant::now()),
-            });
-            let mut st = lock(&self.state);
-            st.sessions.insert(id, slot);
-            st.by_site.insert(site, id);
+            self.keep_session(id, site, browser);
             out.reply.session_id = Some(id.to_string());
         } else {
             browser.close();
         }
         out.reply.account_id = account_id.map(|a| a.to_string());
         out
+    }
+
+    /// Register a live browser as session `id` for `site`.
+    fn keep_session(&self, id: SessionId, site: &str, browser: Box<dyn Browser>) {
+        let slot = Arc::new(Slot {
+            site: site.to_string(),
+            browser: Mutex::new(Some(browser)),
+            last_used: Mutex::new(Instant::now()),
+        });
+        let mut st = lock(&self.state);
+        st.sessions.insert(id, slot);
+        st.by_site.insert(site.to_string(), id);
     }
 
     /// Navigate, fill, and follow an emailed code if the site asks for one.
@@ -533,15 +557,23 @@ impl Broker {
             Err(e) => return exec_status(e),
         };
         match state {
-            PageState::NeedsOtp => self.otp(b, site, started),
+            PageState::NeedsOtp => match self.verify_by_mail(b, site, started) {
+                Ok(st) => page_status(st),
+                Err(s) => s,
+            },
             other => page_status(other),
         }
     }
 
-    fn otp(&self, b: &mut dyn Browser, site: &str, started: SystemTime) -> Status {
-        let Some(mail) = self.deps.mail.current() else {
-            return Status::EmailNotConnected;
-        };
+    /// Poll the mailbox for the code or link the site just sent, and use it.
+    /// `Ok` is the page state afterwards; `Err` a terminal status.
+    fn verify_by_mail(
+        &self,
+        b: &mut dyn Browser,
+        site: &str,
+        started: SystemTime,
+    ) -> Result<PageState, Status> {
+        let mail = self.deps.mail.current().ok_or(Status::EmailNotConnected)?;
         let q = MailQuery {
             site: site.to_string(),
             since: started
@@ -552,12 +584,13 @@ impl Broker {
         loop {
             match self.poll_once(mail.as_ref(), &q) {
                 Poll::Wait => {}
-                Poll::Done(s) => return s,
+                Poll::Done(s) => return Err(s),
                 Poll::Code(code) => {
                     return match b.fill_otp(site, &code) {
-                        Ok(PageState::NeedsOtp) => failed(FailReason::CredentialsRejected),
-                        Ok(st) => page_status(st),
-                        Err(e) => exec_status(e),
+                        // The code field is still there: refused.
+                        Ok(PageState::NeedsOtp) => Ok(PageState::Rejected),
+                        Ok(st) => Ok(st),
+                        Err(e) => Err(exec_status(e)),
                     };
                 }
                 Poll::Link(link) => {
@@ -567,20 +600,15 @@ impl Broker {
                         .and_then(|u| url_site(&u))
                         .is_some_and(|d| d == site);
                     if !on_site {
-                        return failed(FailReason::FenceBlocked);
+                        return Err(failed(FailReason::FenceBlocked));
                     }
-                    if let Err(e) = b.navigate(link.expose()) {
-                        return exec_status(e);
-                    }
-                    return match b.page_state() {
-                        Ok(st) => page_status(st),
-                        Err(e) => exec_status(e),
-                    };
+                    b.navigate(link.expose()).map_err(exec_status)?;
+                    return b.page_state().map_err(exec_status);
                 }
             }
             let now = Instant::now();
             if now >= deadline {
-                return failed(FailReason::Timeout);
+                return Err(failed(FailReason::Timeout));
             }
             std::thread::sleep(self.cfg.otp_poll_every.min(deadline - now));
         }
@@ -712,9 +740,13 @@ fn page_status(s: PageState) -> Status {
         PageState::LoggedIn => Status::LoggedIn {
             session_id: SessionId::random(),
         },
-        PageState::LoginForm | PageState::Rejected => failed(FailReason::CredentialsRejected),
+        PageState::LoginForm | PageState::Rejected | PageState::SignupForm => {
+            failed(FailReason::CredentialsRejected)
+        }
         PageState::Captcha => needs(NeedsUserReason::Captcha),
-        PageState::Unknown => needs(NeedsUserReason::UnknownPage),
+        PageState::Unknown | PageState::VerifyEmail | PageState::NeedsConsent => {
+            needs(NeedsUserReason::UnknownPage)
+        }
         // A second code prompt after the first was handled: treat as refused.
         PageState::NeedsOtp => failed(FailReason::CredentialsRejected),
     }

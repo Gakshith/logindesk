@@ -19,6 +19,7 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, Subcommand};
 use logindesk_daemon::Config;
+use logindesk_daemon::identity::Identity;
 use logindesk_daemon::mailcfg::{MailConfig, MailKind};
 use logindesk_daemon::server;
 use logindesk_policy::{Grants, Tier, site_of};
@@ -120,6 +121,39 @@ enum Cmd {
         #[arg(long)]
         account: Option<String>,
     },
+    /// Create an account on a site through the daemon (as client "cli") and print the reply.
+    Signup {
+        /// Host or URL.
+        site: String,
+        /// The signup page, when not https://<site>/signup.
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// Who signups are made as (stored beside the vault; not secret).
+    #[command(subcommand)]
+    Identity(IdentityCmd),
+}
+
+#[derive(Debug, Subcommand)]
+enum IdentityCmd {
+    /// Set the signup email (plus-addressed per site) and optional full name.
+    Set {
+        /// e.g. you@gmail.com
+        #[arg(long)]
+        email: String,
+        /// Full name for forms that ask for one.
+        #[arg(long)]
+        name: Option<String>,
+    },
+    /// Show the identity.
+    Show,
+}
+
+#[derive(Debug, Clone, Copy, Default, clap::ValueEnum)]
+enum ActionArg {
+    #[default]
+    Login,
+    Signup,
 }
 
 #[derive(Debug, Clone, Copy, clap::ValueEnum)]
@@ -145,9 +179,12 @@ enum GrantCmd {
     Add {
         /// Host or URL; stored as its registrable domain.
         site: String,
-        /// auto: the agent logs in with no prompt. ask: Touch ID each time. deny: never.
+        /// auto: the agent acts with no prompt. ask: Touch ID each time. deny: never.
         #[arg(long, value_enum)]
         tier: TierArg,
+        /// Which action the grant is for.
+        #[arg(long, value_enum, default_value = "login")]
+        action: ActionArg,
     },
     /// List grants.
     List,
@@ -155,6 +192,9 @@ enum GrantCmd {
     Remove {
         /// Host or URL.
         site: String,
+        /// Which action's grant to remove.
+        #[arg(long, value_enum, default_value = "login")]
+        action: ActionArg,
     },
 }
 
@@ -329,15 +369,58 @@ fn run(cli: Cli) -> Result<(), Box<dyn std::error::Error>> {
             if let Some(a) = account {
                 op["account"] = a.into();
             }
-            let r = logindesk_mcp::client::call(&data_dir(&path), "cli", op);
-            writeln!(std::io::stdout().lock(), "{r}")?;
-            if r["status"] == "logged_in" {
-                Ok(())
-            } else {
-                Err(format!("login did not complete ({})", r["status"]).into())
-            }
+            client_flow(&data_dir(&path), op, "logged_in")
         }
+        Cmd::Signup { site, url } => {
+            let mut op = json!({"op": "signup", "site": site});
+            if let Some(u) = url {
+                op["url"] = u.into();
+            }
+            client_flow(&data_dir(&path), op, "created")
+        }
+        Cmd::Identity(cmd) => identity_cmd(&data_dir(&path), cmd),
     }
+}
+
+/// Send `op`, follow `awaiting_approval` with `wait` until the flow ends, print the reply.
+fn client_flow(
+    dir: &Path,
+    op: serde_json::Value,
+    done: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut r = logindesk_mcp::client::call(dir, "cli", op);
+    while r["status"] == "awaiting_approval" {
+        eprintln!("Waiting for you to approve the prompt...");
+        let h = r["handle"].clone();
+        r = logindesk_mcp::client::call(dir, "cli", json!({"op": "wait", "handle": h}));
+    }
+    writeln!(std::io::stdout().lock(), "{r}")?;
+    if r["status"] == done {
+        Ok(())
+    } else {
+        Err(format!("did not complete ({})", r["status"]).into())
+    }
+}
+
+fn identity_cmd(dir: &Path, cmd: IdentityCmd) -> Result<(), Box<dyn std::error::Error>> {
+    std::fs::create_dir_all(dir)?;
+    match cmd {
+        IdentityCmd::Set { email, name } => {
+            Identity { email, name }.save(dir)?;
+            eprintln!("Signups will use this identity (email plus-addressed per site).");
+        }
+        IdentityCmd::Show => match Identity::load(dir)? {
+            Some(i) => {
+                let mut out = std::io::stdout().lock();
+                writeln!(out, "email: {}", i.email)?;
+                writeln!(out, "name:  {}", i.name.unwrap_or_default())?;
+            }
+            None => {
+                return Err("no identity: run `logindesk identity set --email <you@...>`".into());
+            }
+        },
+    }
+    Ok(())
 }
 
 /// Socket, token, audit, profiles and mail.json live beside the vault.
@@ -356,40 +439,51 @@ fn grant_cmd(vault: &Path, cmd: GrantCmd) -> Result<(), Box<dyn std::error::Erro
     }
     let mut g = Grants::load(&gpath)?;
     match cmd {
-        GrantCmd::Add { site, tier } => {
+        GrantCmd::Add { site, tier, action } => {
             let d = domain(&site)?;
             let tier = Tier::from(tier);
-            g.login.insert(d.clone(), tier);
+            let (map, verb) = match action {
+                ActionArg::Login => (&mut g.login, "log in"),
+                ActionArg::Signup => (&mut g.signup, "sign up"),
+            };
+            map.insert(d.clone(), tier);
             g.save(&gpath)?;
             let what = match tier {
-                Tier::Auto => "agents may log in with no prompt",
-                Tier::Ask => "each login asks for Touch ID / your Mac password",
-                Tier::Deny => "logins are refused",
+                Tier::Auto => format!("agents may {verb} with no prompt"),
+                Tier::Ask => format!("each {verb} asks for Touch ID / your Mac password"),
+                Tier::Deny => format!("agents may never {verb}"),
             };
             eprintln!("{d}: {what}.");
         }
         GrantCmd::List => {
             let mut out = std::io::stdout().lock();
+            let t = |tier: &Tier| match tier {
+                Tier::Auto => "auto",
+                Tier::Ask => "ask",
+                Tier::Deny => "deny",
+            };
             for (site, tier) in &g.login {
-                let t = match tier {
-                    Tier::Auto => "auto",
-                    Tier::Ask => "ask",
-                    Tier::Deny => "deny",
-                };
-                writeln!(out, "{site:<40}  {t}")?;
+                writeln!(out, "{site:<40}  login   {}", t(tier))?;
+            }
+            for (site, tier) in &g.signup {
+                writeln!(out, "{site:<40}  signup  {}", t(tier))?;
             }
             eprintln!(
                 "{} grant(s). Sites without one ask each time.",
-                g.login.len()
+                g.login.len() + g.signup.len()
             );
         }
-        GrantCmd::Remove { site } => {
+        GrantCmd::Remove { site, action } => {
             let d = domain(&site)?;
-            if g.login.remove(&d).is_none() {
+            let map = match action {
+                ActionArg::Login => &mut g.login,
+                ActionArg::Signup => &mut g.signup,
+            };
+            if map.remove(&d).is_none() {
                 return Err(format!("no grant for {d}").into());
             }
             g.save(&gpath)?;
-            eprintln!("{d}: grant removed; logins will ask each time.");
+            eprintln!("{d}: grant removed; it will ask each time.");
         }
     }
     Ok(())

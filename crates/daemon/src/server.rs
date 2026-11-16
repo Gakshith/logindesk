@@ -21,8 +21,10 @@ pub const SOCKET: &str = "daemon.sock";
 /// Token file name in the data dir.
 pub const TOKEN: &str = "client.token";
 
-const OPS: [&str; 8] = [
+const OPS: [&str; 10] = [
     "login",
+    "signup",
+    "wait",
     "list_accounts",
     "snapshot",
     "navigate",
@@ -160,7 +162,7 @@ impl Drop for Server {
 
 /// One connection: frames until EOF. An oversize or unreadable frame gets one
 /// `failed/internal` reply and the connection closes.
-pub fn serve_conn(mut s: UnixStream, broker: &Broker, token: &str) {
+pub fn serve_conn(mut s: UnixStream, broker: &Arc<Broker>, token: &str) {
     loop {
         let body = match read_frame(&mut s) {
             Ok(Some(b)) => b,
@@ -185,7 +187,7 @@ pub fn serve_conn(mut s: UnixStream, broker: &Broker, token: &str) {
 }
 
 /// Authenticate and dispatch one frame body.
-pub fn answer(body: &[u8], broker: &Broker, token: &str) -> Reply {
+pub fn answer(body: &[u8], broker: &Arc<Broker>, token: &str) -> Reply {
     debug_assert!(body.len() <= MAX_FRAME);
     let Ok(v) = serde_json::from_slice::<Value>(body) else {
         return Reply::failed(FailReason::Internal).with_message("request is not JSON");

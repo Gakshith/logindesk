@@ -86,6 +86,19 @@ pub enum Op {
         #[serde(rename = "ref")]
         node_ref: u64,
     },
+    /// Create an account on a site with the user's identity and a generated password.
+    Signup {
+        /// Host or URL; resolved to its registrable domain.
+        site: String,
+        /// The signup page, when not `https://<site>/signup`. Must be on `site`.
+        #[serde(default)]
+        url: Option<String>,
+    },
+    /// Wait for a flow that returned `awaiting_approval`.
+    Wait {
+        /// The handle from `awaiting_approval`.
+        handle: String,
+    },
     /// Close a browser session.
     CloseSession {
         /// Session from `login`.
@@ -106,6 +119,8 @@ impl Op {
             Self::Snapshot { .. } => "snapshot",
             Self::Navigate { .. } => "navigate",
             Self::Click { .. } => "click",
+            Self::Signup { .. } => "signup",
+            Self::Wait { .. } => "wait",
             Self::CloseSession { .. } => "close_session",
             Self::Lock => "lock",
             Self::Ping => "ping",
@@ -140,6 +155,9 @@ pub struct Reply {
     /// Account the status is about.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub account_id: Option<String>,
+    /// `awaiting_approval`: pass to `wait`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub handle: Option<String>,
     /// Fixed human text (never page text, never a secret).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub message: Option<String>,
@@ -163,9 +181,13 @@ impl From<&Status> for Reply {
             } => {
                 r.account_id = Some(account_id.to_string());
                 r.session_id = Some(session_id.to_string());
-                r.message = Some(format!("account created with {email_used}"));
+                r.data = Some(serde_json::json!({ "email_used": email_used }));
             }
-            Status::AwaitingApproval { handle } => r.message = Some(format!("handle {handle}")),
+            Status::AwaitingApproval { handle } => {
+                r.handle = Some(handle.to_string());
+                r.message =
+                    Some("waiting for the user to approve; call wait with this handle".to_string());
+            }
             Status::EmailNotConnected => r.message = Some(EMAIL_NOT_CONNECTED_MSG.to_string()),
             Status::NeedsUser { reason } => r.reason = Some(reason.wire().to_string()),
             Status::Failed { reason } => r.reason = Some(reason.wire().to_string()),
