@@ -1,6 +1,6 @@
 {
   "name": "logindesk",
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "Log in to websites for the user without ever seeing a password or one-time code. A local broker fills secrets into its own sealed browser and returns only a status.",
   "author": {
     "name": "logindesk contributors",

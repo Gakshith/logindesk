@@ -1027,7 +1027,7 @@ checksum = "5d15f86d12da44cd8d4ec3c73984537eb7f4cadcb9776a575a0a8a05ca11005c"
 
 [[package]]
 name = "logindesk-approver"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "block2",
  "logindesk-core",
@@ -1038,7 +1038,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-cli"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "clap",
  "logindesk-approver",
@@ -1056,7 +1056,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-core"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "zeroize",
@@ -1064,7 +1064,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-daemon"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "logindesk-approver",
@@ -1081,7 +1081,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-executor"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "libc",
  "logindesk-approver",
@@ -1094,7 +1094,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-mail"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "getrandom 0.4.3",
  "logindesk-core",
@@ -1110,7 +1110,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-mcp"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "logindesk-core",
  "rmcp",
@@ -1122,7 +1122,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-policy"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "psl",
  "serde",
@@ -1133,7 +1133,7 @@ dependencies = [
 
 [[package]]
 name = "logindesk-vault"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "argon2",
  "chacha20poly1305",
@@ -1862,7 +1862,7 @@ dependencies = [
 
 [[package]]
 name = "testbed"
-version = "0.0.0"
+version = "0.1.0"
 dependencies = [
  "axum",
  "base64",

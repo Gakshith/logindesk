@@ -15,10 +15,12 @@ cargo deny check && cargo audit
 - `testbed/`: fake site, hostile MCP client, canary leak harness. Test-only; never a dependency of `crates/*`.
 - Dependencies are pinned exactly (`=x.y.z`) in `[workspace.dependencies]`.
 
-## Architecture (planned)
-- Rust broker daemon: vault, policy, approvals, audit, OTP parser. Everything that touches a secret lives here.
-- MCP server: exposes intent tools only. No tool may ever return a secret value.
-- Browser executor: fills secrets into the page itself; callers get masked snapshots.
+## Architecture
+- `logindesk daemon`: unlocks the vault once and holds the keys; vault, grants, approvals (Touch ID), audit, mail/OTP. Everything that touches a secret lives here. Serves a Unix socket (`docs/socket.md`).
+- `logindesk mcp`: thin stdio MCP server, a socket client with no secrets. Twelve tools; none returns a secret value.
+- Executor: drives its own Chrome over `--remote-debugging-pipe` (no TCP port, never `Runtime.enable`), fills secrets itself, returns masked snapshots with field kinds.
+- Two ways to fill a form: `login` / `signup` map it automatically; `open` + `type` + `fill_secret` let the agent drive odd pages while the broker fills only the secrets (`docs/contract.md` §12).
+- Try it end to end with no real accounts: `scripts/try-it.sh`.
 
 ## Conventions
 - **Secrets never cross the agent boundary.** Not in tool results, logs, errors, or test fixtures that look real.
