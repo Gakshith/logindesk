@@ -12,7 +12,7 @@ cd "$(dirname "$0")/.."
 command -v cargo >/dev/null || export PATH="/opt/homebrew/opt/rustup/bin:$PATH"
 echo "building..." >&2
 cargo build -q -p logindesk-cli -p testbed
-B="$PWD/target/debug"
+B="${CARGO_TARGET_DIR:-$PWD/target}/debug"
 
 DIR="${LOGINDESK_TRY_DIR:-$HOME/.logindesk-try}"
 PORT="${TESTBED_PORT:-47811}"
