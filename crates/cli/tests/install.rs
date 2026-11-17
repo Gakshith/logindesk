@@ -257,15 +257,46 @@ fn claude_code_uses_the_claude_cli_when_present() {
     assert!(calls.contains(&format!("mcp add --scope user logindesk -- {} mcp", exe())));
 }
 
+/// macOS Chrome under a brand-new `HOME` has no login keychain and stalls opening
+/// one. Real users always have their own HOME; this test fakes it, so it points
+/// doctor at a wrapper that adds `--use-mock-keychain`. Test-only: the product keeps
+/// the real keychain, which protects the sealed profile's cookies at rest.
+fn mock_keychain_chrome(h: &Home) -> Option<PathBuf> {
+    let real = Path::new("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome");
+    if !cfg!(target_os = "macos") || !real.is_file() {
+        return None;
+    }
+    let wrapper = h.path("chrome-mock-keychain");
+    std::fs::write(
+        &wrapper,
+        format!(
+            "#!/bin/sh\nexec \"{}\" --use-mock-keychain \"$@\"\n",
+            real.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o755)).unwrap();
+    Some(wrapper)
+}
+
+/// `logindesk --vault <vault> doctor` in the fake HOME, with the mock-keychain Chrome.
+fn doctor(h: &Home, vault: &Path) -> Output {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_logindesk"));
+    cmd.args(["--vault", vault.to_str().unwrap(), "doctor"])
+        .env_clear()
+        .env("HOME", &h.0)
+        .env("PATH", SAFE_PATH);
+    if let Some(chrome) = mock_keychain_chrome(h) {
+        cmd.env("LOGINDESK_CHROME", chrome);
+    }
+    cmd.output().unwrap()
+}
+
 #[test]
 fn doctor_with_missing_vault_reports_and_does_not_panic() {
     let h = Home::new("doctor");
     let vault = h.path("nope/vault.sqlite");
-    let o = ld(
-        &h,
-        SAFE_PATH,
-        &["--vault", vault.to_str().unwrap(), "doctor"],
-    );
+    let o = doctor(&h, &vault);
     let err = String::from_utf8_lossy(&o.stderr);
     eprintln!("{err}");
     assert!(!o.status.success());
@@ -275,15 +306,10 @@ fn doctor_with_missing_vault_reports_and_does_not_panic() {
     assert!(err.contains("✗ daemon: not running"), "{err}");
     assert!(err.contains("– approval popup: not tested"), "{err}");
     assert!(err.contains("stdout:"), "{err}");
-    // With Chrome installed, the sealed browser maps the local test page. On a CI
-    // runner, Chrome under this test's empty environment and brand-new HOME can time
-    // out; there the line only has to be present (testbed/tests/executor.rs drives
-    // real Chrome on CI). Locally the check stays strict.
-    let on_ci = std::env::var_os("CI").is_some();
+    // With Chrome installed, the sealed browser maps the local test page.
     assert!(
         err.contains("✓ sealed browser: launches headless, maps and fills a test login form")
-            || err.contains("– sealed browser: not tested (no Chrome)")
-            || (on_ci && err.contains("✗ sealed browser: ")),
+            || err.contains("– sealed browser: not tested (no Chrome)"),
         "{err}"
     );
     assert!(o.stdout.is_empty(), "doctor wrote to stdout");
@@ -297,11 +323,7 @@ fn doctor_flags_a_client_pointing_at_a_missing_binary() {
         r#"{"mcpServers":{"logindesk":{"command":"/gone/logindesk","args":["mcp"]}}}"#,
     );
     let vault = h.path("vault.sqlite");
-    let o = ld(
-        &h,
-        SAFE_PATH,
-        &["--vault", vault.to_str().unwrap(), "doctor"],
-    );
+    let o = doctor(&h, &vault);
     let err = String::from_utf8_lossy(&o.stderr);
     assert!(
         err.contains("✗ Cursor: points to /gone/logindesk, which does not exist"),
