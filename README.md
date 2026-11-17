@@ -2,6 +2,11 @@
 
 **Let an AI agent log in and sign up for you, without it ever seeing a password or a one-time code.**
 
+<p align="center">
+  <img src="docs/media/logindesk-explainer.gif" alt="An agent calls login; logindesk unlocks the vault, approves with Touch ID, fills the password and emailed code in its own sealed Chrome, and the agent receives only logged_in." width="860">
+</p>
+<p align="center"><a href="docs/media/logindesk-explainer.mp4">Watch the 30-second explainer (MP4)</a></p>
+
 logindesk is a local MCP server for macOS. Your agent (Claude Code, Claude Desktop, Cursor, VS Code, Codex, Gemini CLI) asks it to log in. logindesk unlocks the account from its encrypted vault, types the password into its own sealed Chrome, reads the emailed code from your inbox, and hands back only a status.
 
 ```text
@@ -19,6 +24,8 @@ The agent drives the work; logindesk holds the secrets. No tool returns a passwo
 ---
 
 ## How it works
+
+![The agent does the work; logindesk keeps the secrets. Left: the agent's tool call, masked snapshot and logged_in result. Right: logindesk's sealed Chrome filling the password after Touch ID.](docs/media/logindesk-poster.png)
 
 ```text
  ┌──────────┐  MCP (stdio)  ┌───────────────┐  Unix socket   ┌────────────────────────────┐
