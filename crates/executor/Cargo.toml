@@ -1,6 +1,6 @@
 [package]
 name = "logindesk-executor"
-description = "Browser executor for logindesk (skeleton)."
+description = "Sealed browser for logindesk: Chrome over a private CDP pipe; fills secrets itself."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,23 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[dependencies]
+logindesk-core = { path = "../core" }
+logindesk-policy = { path = "../policy" }
+logindesk-approver = { path = "../approver" }
+serde_json = { workspace = true }
+url = { workspace = true }
+libc = { workspace = true }
+zeroize = { workspace = true }
+
+# Restated: `unsafe_code = "deny"` so ONE module, src/spawn.rs, can allow it to put
+# the CDP pipe on fds 3/4 in the child (pre_exec + dup2).
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
+unwrap_used = "warn"

@@ -1,6 +1,6 @@
 [package]
 name = "logindesk-approver"
-description = "Human approval prompts for logindesk (skeleton)."
+description = "Human approval prompts and approval tokens for logindesk."
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -8,5 +8,27 @@ license.workspace = true
 repository.workspace = true
 publish.workspace = true
 
-[lints]
-workspace = true
+[features]
+# Scripted approver for tests. Never enabled in release builds.
+test-doubles = []
+
+[dependencies]
+logindesk-core = { path = "../core" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = { workspace = true }
+objc2-foundation = { workspace = true }
+objc2-local-authentication = { workspace = true }
+block2 = { workspace = true }
+
+# Restated instead of inherited: `unsafe_code = "deny"` (not "forbid") so ONE
+# module, src/macos.rs, can allow it for the LocalAuthentication FFI calls.
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+
+[lints.clippy]
+dbg_macro = "deny"
+print_stdout = "deny"
+todo = "deny"
+unwrap_used = "warn"

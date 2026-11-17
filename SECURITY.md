@@ -4,11 +4,12 @@ logindesk holds passwords and reads one-time codes, so security reports are the 
 
 ## Status
 
-logindesk is **pre-alpha and has not been audited**. There is no supported release yet. Do not store credentials you can't afford to lose in it.
+logindesk 0.1 is a **working prototype and has not been audited**. Do not store credentials you can't afford to lose in it.
 
 | Version | Supported |
 |---|---|
-| unreleased (`dev`, `main`) | best effort |
+| 0.1.x (`main`) | best effort |
+| older | no |
 
 ## Reporting a vulnerability
 

@@ -13,3 +13,4 @@ workspace = true
 
 [dependencies]
 zeroize = { workspace = true }
+getrandom = { workspace = true }

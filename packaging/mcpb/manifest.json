@@ -1,0 +1,84 @@
+{
+  "manifest_version": "0.3",
+  "name": "logindesk",
+  "display_name": "logindesk",
+  "version": "0.1.0",
+  "description": "Log in to websites without the agent ever seeing a secret.",
+  "long_description": "A local broker fills passwords and emailed one-time codes into its own sealed browser and returns only a status. Needs a running `logindesk daemon` (start it in a terminal with the same binary).",
+  "author": {
+    "name": "logindesk contributors",
+    "url": "https://github.com/Gakshith/logindesk"
+  },
+  "homepage": "https://github.com/Gakshith/logindesk",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/Gakshith/logindesk"
+  },
+  "license": "Apache-2.0",
+  "server": {
+    "type": "binary",
+    "entry_point": "server/logindesk",
+    "mcp_config": {
+      "command": "${__dirname}/server/logindesk",
+      "args": [
+        "mcp"
+      ],
+      "env": {}
+    }
+  },
+  "tools": [
+    {
+      "name": "login",
+      "description": "Log in to a site with a stored account; returns a status and session_id."
+    },
+    {
+      "name": "signup",
+      "description": "Create an account with the user's identity and a generated password, verified by email."
+    },
+    {
+      "name": "wait",
+      "description": "Wait for a login or signup that is waiting on the user's approval."
+    },
+    {
+      "name": "list_accounts",
+      "description": "Stored accounts: id, site and username only."
+    },
+    {
+      "name": "open",
+      "description": "Open a page in the sealed browser to fill it step by step."
+    },
+    {
+      "name": "snapshot",
+      "description": "Masked view of the page with field kinds; field values are never shown."
+    },
+    {
+      "name": "type",
+      "description": "Type non-secret text (name, phone, dropdowns). Password and code fields are refused."
+    },
+    {
+      "name": "fill_secret",
+      "description": "The broker fills a password, new password, sign-up email or emailed code into a field; the value is never returned."
+    },
+    {
+      "name": "press_enter",
+      "description": "Submit a field's form."
+    },
+    {
+      "name": "navigate",
+      "description": "Open a URL on the session's own site."
+    },
+    {
+      "name": "click",
+      "description": "Click an element by its snapshot ref."
+    },
+    {
+      "name": "close_session",
+      "description": "Close a browser session."
+    }
+  ],
+  "compatibility": {
+    "platforms": [
+      "darwin"
+    ]
+  }
+}

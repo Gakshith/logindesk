@@ -1,0 +1,13 @@
+{
+  "name": "logindesk",
+  "version": "0.1.0",
+  "description": "Log in to websites for the user without ever seeing a password or one-time code. A local broker fills secrets into its own sealed browser and returns only a status.",
+  "author": {
+    "name": "logindesk contributors",
+    "url": "https://github.com/Gakshith/logindesk"
+  },
+  "homepage": "https://github.com/Gakshith/logindesk",
+  "repository": "https://github.com/Gakshith/logindesk",
+  "license": "Apache-2.0",
+  "keywords": ["login", "mcp", "browser", "credentials", "security"]
+}

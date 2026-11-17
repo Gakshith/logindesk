@@ -13,7 +13,7 @@
 
 use core::fmt;
 
-use zeroize::Zeroize;
+use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// The text printed in place of any secret value.
 pub const REDACTED: &str = "[REDACTED]";
@@ -48,6 +48,9 @@ impl<T: Zeroize> Drop for Secret<T> {
         self.0.zeroize();
     }
 }
+
+// Marker: `Drop` above zeroizes the value.
+impl<T: Zeroize> ZeroizeOnDrop for Secret<T> {}
 
 impl<T: Zeroize> fmt::Debug for Secret<T> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -118,6 +121,13 @@ mod tests {
         assert!(!out.contains("123456"));
         assert!(!out.contains("49, 50, 51")); // the OTP bytes as a list
         assert!(out.contains("example.com"));
+    }
+
+    #[test]
+    fn secret_is_zeroize_on_drop() {
+        fn assert_zod<T: ZeroizeOnDrop>() {}
+        assert_zod::<SecretString>();
+        assert_zod::<Secret<Vec<u8>>>();
     }
 
     #[test]
