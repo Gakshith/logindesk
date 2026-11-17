@@ -1,0 +1,136 @@
+name: ci
+
+on:
+  push:
+    branches: [main, dev]
+  pull_request:
+  workflow_dispatch:
+
+# Least privilege: nothing by default; each job asks for read-only contents.
+permissions: {}
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: -D warnings
+  RUST_TOOLCHAIN: 1.97.1
+
+jobs:
+  rust:
+    name: fmt · clippy · test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal --component rustfmt,clippy
+      - name: fmt
+        run: cargo fmt --all --check
+      - name: clippy
+        run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Warm up Chrome (a fresh runner's first start is slow)
+        if: runner.os == 'macOS'
+        run: |
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
+            --user-data-dir="$RUNNER_TEMP/warm" --dump-dom about:blank >/dev/null 2>&1 || true
+      - name: test
+        # Real-Chrome tests share a small runner: two at a time.
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=2
+
+  guards:
+    name: dependency and unsafe guards
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - name: logindesk-core never depends on serde
+        run: |
+          if cargo tree -p logindesk-core -e normal --locked --prefix none | grep -E '^serde'; then
+            echo "::error::logindesk-core must not depend on serde (Secret<T> must stay unserializable)"
+            exit 1
+          fi
+      - name: unsafe only in the three audited modules
+        run: |
+          # unsafe lives in exactly three modules, each allowed on its own `mod` line:
+          #   vault/src/hardening.rs (mlock, setrlimit, ptrace), approver/src/macos.rs
+          #   (LocalAuthentication / Touch ID), executor/src/spawn.rs (pipe fds 3/4 for Chrome).
+          # Those crates restate the lints with unsafe_code = "deny"; every other crate
+          # inherits the workspace lints (unsafe_code = forbid).
+          exempt="crates/vault/Cargo.toml crates/approver/Cargo.toml crates/executor/Cargo.toml"
+          for f in crates/*/Cargo.toml testbed/Cargo.toml; do
+            case " $exempt " in *" $f "*)
+              grep -q '^unsafe_code = "deny"' "$f" || { echo "::error file=$f::must deny unsafe_code"; exit 1; }
+              continue;;
+            esac
+            grep -q '^workspace = true' "$f" || { echo "::error file=$f::must inherit [lints] workspace = true"; exit 1; }
+          done
+          hits=$(grep -rn --include='*.rs' -A1 'allow(unsafe_code)' crates testbed | grep -vE 'allow\(unsafe_code\)|^--$' || true)
+          expected=$(printf '%s\n' \
+            'crates/approver/src/lib.rs-14-mod macos;' \
+            'crates/executor/src/lib.rs-14-mod spawn;' \
+            'crates/vault/src/lib.rs-24-pub mod hardening;')
+          [ "$(printf '%s\n' "$hits" | sed -E 's/-[0-9]+-/-N-/' | sort)" = "$(printf '%s\n' "$expected" | sed -E 's/-[0-9]+-/-N-/' | sort)" ] \
+            || { echo "::error::unexpected allow(unsafe_code):"; echo "$hits"; exit 1; }
+          other=$(grep -rnE --include='*.rs' '\bunsafe[[:space:]]*(\{|fn|impl|extern)' crates testbed \
+            | grep -vE '^crates/(vault/src/hardening|approver/src/macos|executor/src/spawn)\.rs:' || true)
+          [ -z "$other" ] || { echo "::error::unsafe outside the audited modules:"; echo "$other"; exit 1; }
+
+  supply-chain:
+    name: cargo deny · cargo audit
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - name: Install toolchain
+        run: rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+      - uses: taiki-e/install-action@cfdb7ed4ccc7c7dce37759eae89dc5674b469b39 # v2.90.3
+        with:
+          tool: cargo-deny@0.20.2,cargo-audit@0.22.2
+      - name: cargo deny
+        run: cargo deny --locked check
+      - name: cargo audit
+        run: cargo audit --deny warnings
+
+  gitleaks:
+    name: gitleaks (full history)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    env:
+      GITLEAKS_VERSION: 8.30.1
+      GITLEAKS_SHA256: 551f6fc83ea457d62a0d98237cbad105af8d557003051f41f3e7ca7b3f2470eb
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+      - name: Install gitleaks (checksum-verified release binary)
+        run: |
+          f="gitleaks_${GITLEAKS_VERSION}_linux_x64.tar.gz"
+          curl -fsSLo "$RUNNER_TEMP/$f" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/$f"
+          echo "${GITLEAKS_SHA256}  $RUNNER_TEMP/$f" | sha256sum -c -
+          tar -xzf "$RUNNER_TEMP/$f" -C "$RUNNER_TEMP" gitleaks
+      - name: Scan every commit
+        run: '"$RUNNER_TEMP/gitleaks" git --redact --verbose --exit-code 1 .'

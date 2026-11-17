@@ -1,0 +1,24 @@
+[package]
+name = "logindesk-mail"
+description = "Mail sources and the OTP parser for logindesk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[dependencies]
+logindesk-core = { path = "../core" }
+logindesk-policy = { path = "../policy" }
+serde_json = { workspace = true }
+ureq = { workspace = true, features = ["rustls"] }
+rustls = { workspace = true }
+webpki-roots = { workspace = true }
+sha2 = { workspace = true }
+getrandom = { workspace = true }
+url = { workspace = true }
+zeroize = { workspace = true }
+
+[lints]
+workspace = true

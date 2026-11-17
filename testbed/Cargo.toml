@@ -1,0 +1,35 @@
+[package]
+name = "testbed"
+description = "Test-only: fake site, hostile MCP client and canary leak harness for logindesk."
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+publish.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+axum.workspace = true
+base64.workspace = true
+hmac.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha1.workspace = true
+tokio = { workspace = true, features = ["rt-multi-thread", "macros", "net", "signal", "process", "io-util", "time", "sync"] }
+
+[dev-dependencies]
+http-body-util.workspace = true
+tempfile.workspace = true
+tower = { workspace = true, features = ["util"] }
+logindesk-executor = { path = "../crates/executor" }
+logindesk-approver = { path = "../crates/approver" }
+logindesk-core = { path = "../crates/core" }
+logindesk-mail = { path = "../crates/mail" }
+logindesk-policy = { path = "../crates/policy" }
+url.workspace = true
+logindesk-daemon = { path = "../crates/daemon" }
+logindesk-vault = { path = "../crates/vault" }
