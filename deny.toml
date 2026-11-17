@@ -24,6 +24,8 @@ allow = [
     "ISC",
     "Unicode-3.0",
     "Zlib",
+    # webpki-roots (Mozilla's CA list, via rustls for Gmail/IMAP): a permissive data licence.
+    "CDLA-Permissive-2.0",
 ]
 
 [licenses.private]

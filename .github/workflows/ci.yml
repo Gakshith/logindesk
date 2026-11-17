@@ -39,8 +39,14 @@ jobs:
         run: cargo fmt --all --check
       - name: clippy
         run: cargo clippy --workspace --all-targets --locked -- -D warnings
+      - name: Warm up Chrome (a fresh runner's first start is slow)
+        if: runner.os == 'macOS'
+        run: |
+          "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome" --headless=new \
+            --user-data-dir="$RUNNER_TEMP/warm" --dump-dom about:blank >/dev/null 2>&1 || true
       - name: test
-        run: cargo test --workspace --locked
+        # Real-Chrome tests share a small runner: two at a time.
+        run: cargo test --workspace --locked --no-fail-fast -- --test-threads=2
 
   guards:
     name: dependency and unsafe guards
@@ -60,22 +66,31 @@ jobs:
             echo "::error::logindesk-core must not depend on serde (Secret<T> must stay unserializable)"
             exit 1
           fi
-      - name: unsafe is forbidden outside crates/vault/src/hardening.rs
+      - name: unsafe only in the three audited modules
         run: |
-          # Every crate except vault inherits workspace lints (unsafe_code = forbid).
+          # unsafe lives in exactly three modules, each allowed on its own `mod` line:
+          #   vault/src/hardening.rs (mlock, setrlimit, ptrace), approver/src/macos.rs
+          #   (LocalAuthentication / Touch ID), executor/src/spawn.rs (pipe fds 3/4 for Chrome).
+          # Those crates restate the lints with unsafe_code = "deny"; every other crate
+          # inherits the workspace lints (unsafe_code = forbid).
+          exempt="crates/vault/Cargo.toml crates/approver/Cargo.toml crates/executor/Cargo.toml"
           for f in crates/*/Cargo.toml testbed/Cargo.toml; do
-            [ "$f" = crates/vault/Cargo.toml ] && continue
+            case " $exempt " in *" $f "*)
+              grep -q '^unsafe_code = "deny"' "$f" || { echo "::error file=$f::must deny unsafe_code"; exit 1; }
+              continue;;
+            esac
             grep -q '^workspace = true' "$f" || { echo "::error file=$f::must inherit [lints] workspace = true"; exit 1; }
           done
-          grep -q '^unsafe_code = "deny"' crates/vault/Cargo.toml || { echo "::error::vault must deny unsafe_code"; exit 1; }
-          # Exactly one allow(unsafe_code) in the tree, directly on `pub mod hardening;` in vault.
-          hits=$(grep -rn --include='*.rs' 'allow(unsafe_code)' crates testbed || true)
-          [ "$(printf '%s\n' "$hits" | grep -c .)" = 1 ] && printf '%s\n' "$hits" | grep -q '^crates/vault/src/lib.rs:' \
-            && grep -A1 'allow(unsafe_code)' crates/vault/src/lib.rs | grep -q '^pub mod hardening;$' \
+          hits=$(grep -rn --include='*.rs' -A1 'allow(unsafe_code)' crates testbed | grep -vE 'allow\(unsafe_code\)|^--$' || true)
+          expected=$(printf '%s\n' \
+            'crates/approver/src/lib.rs-14-mod macos;' \
+            'crates/executor/src/lib.rs-14-mod spawn;' \
+            'crates/vault/src/lib.rs-24-pub mod hardening;')
+          [ "$(printf '%s\n' "$hits" | sed -E 's/-[0-9]+-/-N-/' | sort)" = "$(printf '%s\n' "$expected" | sed -E 's/-[0-9]+-/-N-/' | sort)" ] \
             || { echo "::error::unexpected allow(unsafe_code):"; echo "$hits"; exit 1; }
-          # No unsafe block, fn, impl or extern anywhere else.
-          other=$(grep -rnE --include='*.rs' '\bunsafe[[:space:]]*(\{|fn|impl|extern)' crates testbed | grep -v '^crates/vault/src/hardening.rs:' || true)
-          [ -z "$other" ] || { echo "::error::unsafe outside crates/vault/src/hardening.rs:"; echo "$other"; exit 1; }
+          other=$(grep -rnE --include='*.rs' '\bunsafe[[:space:]]*(\{|fn|impl|extern)' crates testbed \
+            | grep -vE '^crates/(vault/src/hardening|approver/src/macos|executor/src/spawn)\.rs:' || true)
+          [ -z "$other" ] || { echo "::error::unsafe outside the audited modules:"; echo "$other"; exit 1; }
 
   supply-chain:
     name: cargo deny · cargo audit
